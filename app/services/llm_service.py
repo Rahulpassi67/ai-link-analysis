@@ -176,13 +176,21 @@ def validate_analysis(result: dict) -> dict:
         if not isinstance(service, dict):
             raise ValueError("Each service must be an object.")
 
+        # Add a safe default if Gemini omits target_customer.
+        if not service.get("target_customer"):
+            service["target_customer"] = "Not available"
+
+        # Default inferred to False when the model omits the flag.
+        if "inferred" not in service:
+            service["inferred"] = False
+
         for field in required_service_fields:
             if field not in service:
                 raise ValueError(
                     f"Service is missing field: {field}"
                 )
 
-    # Fix inferred labels and Boolean values
+    # Fix inferred labels and Boolean values.
     result["top_services"] = normalize_inferred_fields(services)
 
     # Validate target audience
