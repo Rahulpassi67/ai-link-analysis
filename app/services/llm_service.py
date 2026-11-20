@@ -329,6 +329,31 @@ STRICT RULES:
 19. Return valid JSON only.
 20. Do not include Markdown code fences, introductory text,
     explanations or comments outside the JSON object.
+21. Never invent statistics, percentages, customer counts,
+    revenue figures, performance claims or numerical benefits.
+
+22. Only include numerical claims when explicitly supported
+    by the extracted website content.
+
+23. Competitor strengths and weaknesses must be clearly
+    identified as AI-generated assessments unless supported
+    by reliable evidence in the provided website data.
+
+24. Do not present competitor assessments as verified facts
+    when external competitor research has not been performed.
+
+25. If reliable competitor information is unavailable,
+    explicitly state "Not verified from provided website data".
+
+26. Do not invent competitor pricing, market share,
+    rankings or customer numbers.
+27. Use clear, concise geographic descriptions.
+28. Do not use redundant phrases such as "Global Worldwide".
+29. Use "Worldwide" only when the website supports a global
+    geographic presence. Otherwise, use the specific regions
+    mentioned on the website.
+30. If geographic information is unavailable, return
+    "Not available".
 """
 
     max_attempts = 3
