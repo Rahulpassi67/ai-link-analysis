@@ -1,7 +1,7 @@
 
-
 import asyncio
 import json
+import re
 
 from google import genai
 from google.genai import types
@@ -10,21 +10,219 @@ from app.config import GEMINI_API_KEY, GEMINI_MODEL
 
 
 # Initialize Gemini client
-if not GEMINI_API_KEY:
-    client = None
-else:
+if GEMINI_API_KEY:
     client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    client = None
 
 
-async def analyze_with_ai(website_data: dict):
+def normalize_inferred_fields(services: list) -> list:
     """
-    Analyze extracted website information using Gemini.
-    Returns structured business, competitor, SEO and marketing insights.
+    Ensure inferred=True whenever the industry or customer
+    segment is explicitly marked as inferred.
+    """
+    for service in services:
+        industry = str(service.get("target_industry", ""))
+        customer = str(service.get("target_customer", ""))
+
+        is_inferred = (
+            "(inferred)" in industry.lower()
+            or "(inferred)" in customer.lower()
+        )
+
+        service["inferred"] = is_inferred
+
+        # Keep the inferred label consistent with the Boolean.
+        if is_inferred:
+            if "(Inferred)" not in industry:
+                service["target_industry"] = f"{industry} (Inferred)"
+
+    return services
+
+
+def validate_analysis(result: dict) -> dict:
+    """
+    Validate Gemini's JSON response and required sections.
+    """
+
+    required_sections = {
+        "competitor_analysis",
+        "target_search_queries",
+        "seo_analysis",
+        "top_services",
+        "target_audience",
+    }
+
+    if not isinstance(result, dict):
+        raise ValueError("Gemini response must be a JSON object.")
+
+    missing = required_sections - result.keys()
+
+    if missing:
+        raise ValueError(
+            f"Missing required sections: {', '.join(sorted(missing))}"
+        )
+
+    # Validate competitor analysis
+    competitor = result["competitor_analysis"]
+
+    if not isinstance(competitor, dict):
+        raise ValueError("Invalid competitor analysis format.")
+
+    required_competitor_fields = [
+        "brand_name",
+        "overview",
+        "category",
+        "products_services",
+        "competitors",
+        "brand_advantages",
+        "positioning_opportunities",
+    ]
+
+    for field in required_competitor_fields:
+        if field not in competitor:
+            raise ValueError(
+                f"Missing competitor analysis field: {field}"
+            )
+
+    if not isinstance(competitor["competitors"], list):
+        raise ValueError("Competitors must be a list.")
+
+    # Validate target search queries
+    queries = result["target_search_queries"]
+
+    if not isinstance(queries, list) or len(queries) != 5:
+        raise ValueError(
+            "Gemini must return exactly 5 search queries."
+        )
+
+    required_query_fields = [
+        "query",
+        "platform",
+        "intent",
+        "relevance",
+        "target_audience",
+    ]
+
+    allowed_platforms = {
+        "Google",
+        "Facebook",
+        "Instagram",
+        "LinkedIn",
+        "X",
+    }
+
+    for query in queries:
+        if not isinstance(query, dict):
+            raise ValueError("Each search query must be an object.")
+
+        for field in required_query_fields:
+            if not query.get(field):
+                raise ValueError(
+                    f"Search query is missing field: {field}"
+                )
+
+        if query["platform"] not in allowed_platforms:
+            raise ValueError(
+                f"Unsupported search platform: {query['platform']}"
+            )
+
+    platforms = {item["platform"] for item in queries}
+
+    if platforms != allowed_platforms:
+        raise ValueError(
+            "Search queries must cover Google, Facebook, Instagram, "
+            "LinkedIn and X."
+        )
+
+    # Validate SEO analysis
+    seo = result["seo_analysis"]
+
+    if not isinstance(seo, dict):
+        raise ValueError("Invalid SEO analysis format.")
+
+    required_seo_fields = [
+        "primary_keywords",
+        "secondary_keywords",
+        "long_tail_keywords",
+        "business_keywords",
+        "seo_title",
+        "meta_description",
+        "content_recommendations",
+    ]
+
+    for field in required_seo_fields:
+        if field not in seo:
+            raise ValueError(f"Missing SEO field: {field}")
+
+    # Validate top services
+    services = result["top_services"]
+
+    if not isinstance(services, list) or len(services) != 5:
+        raise ValueError(
+            "Gemini must return exactly 5 services."
+        )
+
+    required_service_fields = [
+        "name",
+        "description",
+        "target_industry",
+        "target_customer",
+        "business_benefit",
+        "inferred",
+    ]
+
+    for service in services:
+        if not isinstance(service, dict):
+            raise ValueError("Each service must be an object.")
+
+        for field in required_service_fields:
+            if field not in service:
+                raise ValueError(
+                    f"Service is missing field: {field}"
+                )
+
+    # Fix inferred labels and Boolean values
+    result["top_services"] = normalize_inferred_fields(services)
+
+    # Validate target audience
+    audience = result["target_audience"]
+
+    if not isinstance(audience, dict):
+        raise ValueError("Invalid target audience format.")
+
+    required_audience_fields = [
+        "primary_audience",
+        "secondary_audience",
+        "industry_segments",
+        "business_types",
+        "customer_profiles",
+        "geographic_focus",
+        "needs_and_challenges",
+        "interests",
+        "recommended_marketing_segments",
+    ]
+
+    for field in required_audience_fields:
+        if field not in audience:
+            raise ValueError(
+                f"Missing target audience field: {field}"
+            )
+
+    return result
+
+
+async def analyze_with_ai(website_data: dict) -> dict:
+    """
+    Analyze extracted website information using Google Gemini.
+
+    Returns structured competitor, search query, SEO,
+    services and target audience analysis.
     """
 
     if client is None:
         raise ValueError(
-            "GEMINI_API_KEY is missing. Check your environment variables."
+            "GEMINI_API_KEY is missing. Configure it in your environment."
         )
 
     prompt = f"""
@@ -105,193 +303,72 @@ STRICT RULES:
    rankings, customer counts, revenue figures or factual claims.
 5. Never generate numerical statistics unless explicitly
    supported by the extracted website content.
-6. Use Google, Facebook, Instagram, LinkedIn and X as
-   search platforms.
-7. Use each of these five platforms exactly once in the
-   five target_search_queries. Do not repeat platforms.
-8. Do not claim that a query has actual search volume or
+6. Use these search platforms across the five queries:
+   Google, Facebook, Instagram, LinkedIn and X.
+   Use each platform exactly once.
+7. Do not claim that a query has actual search volume or
    verified popularity unless reliable data is provided.
-9. Use extracted website content as the primary source.
+8. Use extracted website content as the primary source.
+9. Clearly distinguish verified website facts from AI-generated
+   suggestions and recommendations.
 10. Mark inferred services with inferred=true.
-11. Clearly distinguish verified website facts from
-    suggestions and AI-generated recommendations.
-12. If information is unavailable, use "Not available".
-13. Infer relevant industry segments only when reasonable.
-14. Clearly label inferred segments with "(Inferred)".
-15. Do not present inferred information as verified facts.
-16. Keep recommendations practical, relevant and specific
+11. If the industry or customer segment is inferred,
+    append "(Inferred)" to the relevant field.
+12. Never present inferred information as verified facts.
+13. If information is unavailable, use "Not available".
+14. Infer relevant industry segments only when reasonable.
+    Clearly label inferred segments with "(Inferred)".
+15. Keep recommendations practical, relevant and specific
     to the analyzed brand.
-17. Do not repeat irrelevant or unrelated website content.
-18. Ensure all five search queries contain query, platform,
+16. Do not repeat irrelevant or unrelated website content.
+17. Ensure all five search queries contain query, platform,
     intent, relevance and target_audience.
-19. Ensure all five services contain name, description,
+18. Ensure all five services contain name, description,
     target_industry, target_customer, business_benefit
     and inferred.
-20. Return valid JSON only. Do not include Markdown fences,
-    introductory text, explanations or comments.
-21. For competitor strengths and weaknesses, begin each
-    item with either "Verified:" or
-    "AI-generated suggestion:".
-22. Use "Verified:" only when the website data or reliable
-    supplied evidence supports the claim.
-23. Use "AI-generated suggestion:" for assumptions or
-    suggestions that have not been independently verified.
-24. Set inferred=true if a service's target industry or
-    target customer is inferred rather than explicitly
-    supported by the website content.
-25. Set inferred=false only when the relevant information
-    is explicitly supported by the website content.
-26. Do not confuse products listed on the website with
-    services that the business actually provides.
-
-Follow the exact JSON structure above.
+19. Return valid JSON only.
+20. Do not include Markdown code fences, introductory text,
+    explanations or comments outside the JSON object.
 """
 
     max_attempts = 3
 
     for attempt in range(max_attempts):
         try:
-            response = await client.aio.models.generate_content(
+            response = await asyncio.to_thread(
+                client.models.generate_content,
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.2
-                )
+                    temperature=0.2,
+                ),
             )
 
             if not response.text:
                 raise ValueError("Gemini returned an empty response.")
 
-            result = json.loads(response.text)
+            response_text = response.text.strip()
 
-            # Validate top-level structure
-            required_sections = {
-                "competitor_analysis",
-                "target_search_queries",
-                "seo_analysis",
-                "top_services",
-                "target_audience"
-            }
+            # Remove accidental Markdown code fences
+            response_text = re.sub(
+                r"^```(?:json)?\s*|\s*```$",
+                "",
+                response_text,
+                flags=re.IGNORECASE,
+            ).strip()
 
-            if not isinstance(result, dict):
-                raise ValueError(
-                    "Gemini response must be a JSON object."
-                )
+            result = json.loads(response_text)
 
-            missing = required_sections - result.keys()
+            return validate_analysis(result)
 
-            if missing:
-                raise ValueError(
-                    f"Missing required sections: {', '.join(missing)}"
-                )
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Gemini returned invalid JSON: {error}"
+            ) from error
 
-            # Validate search queries
-            queries = result["target_search_queries"]
-
-            if not isinstance(queries, list) or len(queries) != 5:
-                raise ValueError(
-                    "Gemini must return exactly 5 search queries."
-                )
-
-            required_platforms = {
-                "google",
-                "facebook",
-                "instagram",
-                "linkedin",
-                "x"
-            }
-
-            actual_platforms = {
-                str(item.get("platform", "")).strip().lower()
-                for item in queries
-                if isinstance(item, dict)
-            }
-
-            if len(actual_platforms) != 5:
-                raise ValueError(
-                    "Each search query must use a different platform."
-                )
-
-            if actual_platforms != required_platforms:
-                raise ValueError(
-                    "Search queries must cover Google, Facebook, "
-                    "Instagram, LinkedIn and X exactly once."
-                )
-
-            query_fields = {
-                "query",
-                "platform",
-                "intent",
-                "relevance",
-                "target_audience"
-            }
-
-            for item in queries:
-                if not isinstance(item, dict):
-                    raise ValueError("Invalid search query format.")
-
-                missing_fields = query_fields - item.keys()
-
-                if missing_fields:
-                    raise ValueError(
-                        f"Search query missing fields: {missing_fields}"
-                    )
-
-            # Validate top services
-            services = result["top_services"]
-
-            if not isinstance(services, list) or len(services) != 5:
-                raise ValueError(
-                    "Gemini must return exactly 5 top services."
-                )
-
-            service_fields = {
-                "name",
-                "description",
-                "target_industry",
-                "target_customer",
-                "business_benefit",
-                "inferred"
-            }
-
-            for service in services:
-                if not isinstance(service, dict):
-                    raise ValueError("Invalid service format.")
-
-                missing_fields = service_fields - service.keys()
-
-                if missing_fields:
-                    raise ValueError(
-                        f"Service missing fields: {missing_fields}"
-                    )
-
-                if not isinstance(service["inferred"], bool):
-                    raise ValueError(
-                        "Service inferred field must be true or false."
-                    )
-
-            # Validate competitor analysis
-            competitor_data = result["competitor_analysis"]
-
-            if not isinstance(competitor_data, dict):
-                raise ValueError(
-                    "Invalid competitor_analysis format."
-                )
-
-            if not isinstance(competitor_data.get("competitors"), list):
-                raise ValueError(
-                    "Competitors must be returned as a list."
-                )
-
-            # Validate SEO and audience sections
-            if not isinstance(result["seo_analysis"], dict):
-                raise ValueError("Invalid SEO analysis format.")
-
-            if not isinstance(result["target_audience"], dict):
-                raise ValueError("Invalid target audience format.")
-
-            return result
+        except ValueError:
+            raise
 
         except Exception as error:
             error_message = str(error).upper()
@@ -303,11 +380,9 @@ Follow the exact JSON structure above.
                     "UNAVAILABLE",
                     "429",
                     "RESOURCE_EXHAUSTED",
+                    "500",
                     "INTERNAL",
-                    "SEARCH QUERIES",
-                    "PLATFORMS",
-                    "MISSING FIELDS",
-                    "MUST RETURN"
+                    "TIMEOUT",
                 ]
             )
 
@@ -318,4 +393,7 @@ Follow the exact JSON structure above.
             raise ValueError(
                 f"Gemini analysis failed: {error}"
             ) from error
+
+    raise ValueError("Gemini analysis failed after multiple attempts.")
+
 
