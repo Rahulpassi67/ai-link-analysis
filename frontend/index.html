@@ -1,0 +1,235 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0b0d14">
+    <title>Linkly AI | Website Intelligence</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar">
+            <a class="brand" href="#">
+                <span class="brand-icon">✳</span>
+                <span>Linkly<span class="brand-ai"> AI</span></span>
+            </a>
+
+            <div class="side-label">WORKSPACE</div>
+            <nav class="navigation">
+                <a href="#overview" class="nav-link active">▦ <span>Overview</span></a>
+                <a href="#competitors" class="nav-link">◈ <span>Competitors</span></a>
+                <a href="#seo" class="nav-link">⌕ <span>SEO Intelligence</span></a>
+                <a href="#services" class="nav-link">◇ <span>Products & Services</span></a>
+                <a href="#audience" class="nav-link">◎ <span>Target Audience</span></a>
+            </nav>
+
+            <div class="sidebar-bottom">
+                <div class="side-label">YOUR TOOLS</div>
+                <button class="nav-link" id="downloadBtn">↓ <span>Export Report</span></button>
+                <div class="profile">
+                    <div class="avatar">AI</div>
+                    <div>
+                        <strong>Linkly Intelligence</strong>
+                        <small>AI Workspace</small>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <main class="main-content" id="overview">
+            <header class="topbar">
+                <div>
+                    <div class="eyebrow">AI WEBSITE INTELLIGENCE</div>
+                    <h1>Website Analysis</h1>
+                    <p class="muted">Understand your market. Discover your competition. Grow smarter.</p>
+                </div>
+                <div class="status-pill"><span></span> AI Engine Ready</div>
+            </header>
+
+            <section class="search-panel">
+                <div class="search-heading">
+                    <div>
+                        <h2>Analyze a website</h2>
+                        <p>Enter any publicly accessible website URL to generate an AI-powered report.</p>
+                    </div>
+                    <span class="sparkle">✦ AI POWERED</span>
+                </div>
+
+                <form id="analysisForm">
+                    <div class="url-input-wrap">
+                        <span>↗</span>
+                        <input id="websiteUrl" type="url"
+                            placeholder="https://example.com"
+                            required>
+                        <button type="submit" id="analyzeBtn">
+                            <span id="buttonText">Analyze Website</span>
+                            <span>→</span>
+                        </button>
+                    </div>
+                </form>
+
+                <p class="search-hint" id="statusMessage">✦ Your analysis will include SEO, competitors, services and audience insights.</p>
+            </section>
+
+            <div class="loading-panel hidden" id="loadingPanel">
+                <div class="loader"></div>
+                <h3>Analyzing your website...</h3>
+                <p>Extracting website data and generating AI insights. This may take a moment.</p>
+            </div>
+
+            <div class="error-panel hidden" id="errorPanel" role="alert"></div>
+
+            <section id="results" class="hidden">
+                <div class="section-heading">
+                    <div>
+                        <div class="eyebrow">ANALYSIS RESULTS</div>
+                        <h2>Website Overview</h2>
+                    </div>
+                    <span class="result-tag">✓ Analysis Complete</span>
+                </div>
+
+                <div class="website-card">
+                    <div class="website-symbol">◈</div>
+                    <div class="website-info">
+                        <h3 id="websiteTitle">Website title</h3>
+                        <a id="websiteLink" href="#" target="_blank" rel="noopener noreferrer">Website URL</a>
+                        <p id="websiteDescription"></p>
+                    </div>
+                </div>
+
+                <section class="content-section" id="competitors">
+                    <div class="section-heading">
+                        <div>
+                            <div class="eyebrow">MARKET POSITION</div>
+                            <h2>Competitor Analysis</h2>
+                        </div>
+                    </div>
+                    <div class="overview-grid">
+                        <div class="metric-card">
+                            <span class="metric-label">Brand</span>
+                            <h3 id="brandName">—</h3>
+                            <p id="brandCategory">—</p>
+                        </div>
+                        <div class="metric-card wide-card">
+                            <span class="metric-label">Brand Overview</span>
+                            <p id="brandOverview">—</p>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <h3>Competitors</h3>
+                        <div id="competitorList" class="competitor-list"></div>
+                    </div>
+                    <div class="panel">
+                        <h3>Brand Advantages</h3>
+                        <div id="advantagesList" class="tag-list"></div>
+                    </div>
+                </section>
+
+                <section class="content-section" id="seo">
+                    <div class="section-heading">
+                        <div>
+                            <div class="eyebrow">SEARCH VISIBILITY</div>
+                            <h2>SEO Intelligence</h2>
+                        </div>
+                    </div>
+                    <div class="seo-grid">
+                        <div class="panel">
+                            <h3>Primary Keywords</h3>
+                            <div id="primaryKeywords" class="tag-list"></div>
+                        </div>
+                        <div class="panel">
+                            <h3>Secondary Keywords</h3>
+                            <div id="secondaryKeywords" class="tag-list"></div>
+                        </div>
+                        <div class="panel">
+                            <h3>Long-tail Keywords</h3>
+                            <div id="longTailKeywords" class="keyword-list"></div>
+                        </div>
+                        <div class="panel">
+                            <h3>Business Keywords</h3>
+                            <div id="businessKeywords" class="tag-list"></div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <h3>Target Search Queries</h3>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Search Query</th>
+                                        <th>Platform</th>
+                                        <th>Intent</th>
+                                        <th>Relevance</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="queryTable"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <h3>SEO Recommendations</h3>
+                        <ul id="seoRecommendations" class="recommendation-list"></ul>
+                    </div>
+                </section>
+
+                <section class="content-section" id="services">
+                    <div class="section-heading">
+                        <div>
+                            <div class="eyebrow">BUSINESS OFFERINGS</div>
+                            <h2>Top Products & Services</h2>
+                        </div>
+                    </div>
+                    <div id="servicesGrid" class="services-grid"></div>
+                </section>
+
+                <section class="content-section" id="audience">
+                    <div class="section-heading">
+                        <div>
+                            <div class="eyebrow">CUSTOMER INTELLIGENCE</div>
+                            <h2>Target Audience</h2>
+                        </div>
+                    </div>
+                    <div class="audience-grid">
+                        <div class="panel">
+                            <h3>Primary Audience</h3>
+                            <p id="primaryAudience"></p>
+                        </div>
+                        <div class="panel">
+                            <h3>Secondary Audience</h3>
+                            <p id="secondaryAudience"></p>
+                        </div>
+                        <div class="panel">
+                            <h3>Industry Segments</h3>
+                            <div id="industrySegments" class="tag-list"></div>
+                        </div>
+                        <div class="panel">
+                            <h3>Business Types</h3>
+                            <div id="businessTypes" class="tag-list"></div>
+                        </div>
+                        <div class="panel">
+                            <h3>Customer Profiles</h3>
+                            <ul id="customerProfiles" class="recommendation-list"></ul>
+                        </div>
+                        <div class="panel">
+                            <h3>Customer Needs & Challenges</h3>
+                            <ul id="customerNeeds" class="recommendation-list"></ul>
+                        </div>
+                    </div>
+                </section>
+            </section>
+
+            <footer>
+                <span>✳ Linkly AI</span>
+                <span>Powered by Gemini AI · Website Intelligence</span>
+            </footer>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

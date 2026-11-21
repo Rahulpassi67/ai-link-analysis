@@ -1,5 +1,8 @@
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
 from app.services.website_extractor import extract_website_content
@@ -15,15 +18,7 @@ app = FastAPI(
 
 class LinkRequest(BaseModel):
     url: HttpUrl
-
-
-@app.get("/")
-def home():
-    return {
-        "message": "AI Link Analysis API is running!",
-        "status": "success"
-    }
-
+3
 
 @app.get("/health")
 def health_check():
@@ -36,7 +31,6 @@ async def link_analysis(request: LinkRequest):
         url = str(request.url)
 
         website_data = await extract_website_content(url)
-
         analysis = await analyze_with_ai(website_data)
 
         return {
@@ -53,9 +47,19 @@ async def link_analysis(request: LinkRequest):
         raise HTTPException(status_code=400, detail=str(error))
 
     except Exception as error:
-       print("ACTUAL ERROR:", repr(error))
+        print("ACTUAL ERROR:", repr(error))
+        raise HTTPException(
+            status_code=502,
+            detail="Website analysis failed. Please try again."
+        )
 
-       raise HTTPException(
-        status_code=502,
-        detail=str(error)
-      )
+
+# Serve the frontend from the project-level frontend directory.
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+app.mount(
+    "/",
+    StaticFiles(directory=str(FRONTEND_DIR), html=True),
+    name="frontend"
+)
+
