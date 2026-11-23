@@ -264,10 +264,12 @@ def test_company_extraction_invalid_json_is_not_retried(monkeypatch):
 
 def test_gemini_retries_transient_errors_with_a_controlled_retry(monkeypatch):
     calls = {"count": 0}
+    models = []
 
     class FakeModels:
         def generate_content(self, **kwargs):
             calls["count"] += 1
+            models.append(kwargs["model"])
             if calls["count"] == 1:
                 raise RuntimeError("503 temporarily unavailable")
             return type("Response", (), {"text": "{}"})()
@@ -289,9 +291,83 @@ def test_gemini_retries_transient_errors_with_a_controlled_retry(monkeypatch):
 
     assert result is VALID_ANALYSIS
     assert calls["count"] == 2
+    assert models == ["gemini-3.5-flash-lite"] * 2
 
 
-def test_gemini_quota_errors_log_sanitized_details_after_bounded_retries(monkeypatch, caplog):
+def test_gemini_falls_back_once_after_primary_transient_retries(monkeypatch, caplog):
+    models = []
+    delays = []
+
+    class FakeServerError(Exception):
+        status_code = 503
+        message = "upstream unavailable"
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            models.append(kwargs["model"])
+            if kwargs["model"] == "gemini-3.5-flash-lite":
+                raise FakeServerError(FakeServerError.message)
+            return type("Response", (), {"text": "{}"})()
+
+    monkeypatch.setattr(
+        llm_service,
+        "client",
+        type("Client", (), {"models": FakeModels()})()
+    )
+    monkeypatch.setattr(llm_service, "validate_website_data", lambda _data: None)
+    monkeypatch.setattr(llm_service, "validate_analysis", lambda _data, **_kwargs: VALID_ANALYSIS)
+    monkeypatch.setattr(llm_service, "add_semantic_competitor_ranking", lambda data: data)
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(llm_service.asyncio, "sleep", record_sleep)
+    with caplog.at_level("INFO", logger="app.services.llm_service"):
+        result = asyncio.run(llm_service.analyze_with_ai({"content": "ignored"}))
+
+    assert result is VALID_ANALYSIS
+    assert models == ["gemini-3.5-flash-lite"] * 3 + ["gemini-3.8-flash"]
+    assert delays == [0.5, 1.0]
+    assert any(
+        getattr(record, "diagnostic_event", None) == "gemini.analysis_succeeded"
+        and record.model == "gemini-3.8-flash"
+        for record in caplog.records
+    )
+
+
+def test_gemini_does_not_fallback_for_permanent_or_validation_errors(monkeypatch):
+    models = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            models.append(kwargs["model"])
+            if "permanent" in kwargs["contents"]:
+                raise RuntimeError("400 INVALID_ARGUMENT")
+            return type("Response", (), {"text": '{"invalid": true}'})()
+
+    monkeypatch.setattr(
+        llm_service,
+        "client",
+        type("Client", (), {"models": FakeModels()})()
+    )
+    monkeypatch.setattr(llm_service, "validate_website_data", lambda _data: None)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(llm_service.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(ExternalServiceError):
+        asyncio.run(llm_service.analyze_with_ai({"content": "permanent failure"}))
+    assert models == ["gemini-3.5-flash-lite"]
+
+    models.clear()
+    with pytest.raises(ExternalServiceError):
+        asyncio.run(llm_service.analyze_with_ai({"content": "validation failure"}))
+    assert models == ["gemini-3.5-flash-lite"] * 2
+
+
+def test_gemini_quota_errors_log_sanitized_details_and_use_one_fallback(monkeypatch, caplog):
     calls = {"count": 0}
 
     class FakeModels:
@@ -314,17 +390,18 @@ def test_gemini_quota_errors_log_sanitized_details_after_bounded_retries(monkeyp
         with pytest.raises(ExternalServiceError) as raised:
             asyncio.run(llm_service.analyze_with_ai({"content": "ignored"}))
 
-    assert calls["count"] == 3
+    assert calls["count"] == 4
     assert raised.value.status_code == 503
     assert "DO_NOT_EXPOSE" not in str(raised.value)
     request_failures = [
         record for record in caplog.records
         if getattr(record, "diagnostic_event", None) == "gemini.request_failed"
     ]
-    assert len(request_failures) == 3
+    assert len(request_failures) == 4
     assert request_failures[0].status_code == 429
     assert "quota key=[REDACTED]" in request_failures[0].error_message
     assert request_failures[-1].retrying is False
+    assert request_failures[-1].model == "gemini-3.8-flash"
     assert "DO_NOT_EXPOSE" not in caplog.text
 
 

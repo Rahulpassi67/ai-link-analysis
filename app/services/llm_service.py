@@ -17,6 +17,8 @@ from app.utils.errors import (
 
 logger = logging.getLogger(__name__)
 GEMINI_REQUEST_TIMEOUT = 20
+PRIMARY_GEMINI_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_GEMINI_MODEL = "gemini-3.8-flash"
 
 
 def _safe_gemini_exception_details(error: Exception) -> tuple[int | None, str]:
@@ -1818,15 +1820,18 @@ STRICT OUTPUT RULES:
 
     max_attempts = 3
     schema_correction_used = False
+    active_model = PRIMARY_GEMINI_MODEL
+    fallback_model_used = False
+    attempt = 0
 
-    for attempt in range(max_attempts):
+    while True:
 
         try:
 
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
-                    model=GEMINI_MODEL,
+                    model=active_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
@@ -1878,7 +1883,8 @@ STRICT OUTPUT RULES:
                     response_metadata=response_metadata,
                 )
                 if (
-                    attempt < max_attempts - 1
+                    not fallback_model_used
+                    and attempt < max_attempts - 1
                     and finish_reason not in {"MAX_TOKENS", "LENGTH"}
                 ):
                     logger.warning(
@@ -1888,6 +1894,7 @@ STRICT OUTPUT RULES:
                         max_attempts,
                     )
                     await asyncio.sleep(min(0.5 * (2 ** attempt), 1.5))
+                    attempt += 1
                     continue
                 raise ExternalServiceError(
                     "gemini_incomplete_output" if finish_reason in {"MAX_TOKENS", "LENGTH"} else "gemini_invalid_response",
@@ -1916,7 +1923,8 @@ STRICT OUTPUT RULES:
                     response_metadata=response_metadata,
                 )
                 if (
-                    not schema_correction_used
+                    not fallback_model_used
+                    and not schema_correction_used
                     and attempt < max_attempts - 1
                     and finish_reason not in {"MAX_TOKENS", "LENGTH"}
                     and (missing_fields or invalid_fields)
@@ -1956,6 +1964,7 @@ STRICT OUTPUT RULES:
                         "Gemini analysis schema validation failed (%s); retrying once with field-level correction.",
                         failure_category,
                     )
+                    attempt += 1
                     continue
                 raise ExternalServiceError(
                     "gemini_invalid_response",
@@ -1970,6 +1979,14 @@ STRICT OUTPUT RULES:
             validated_result["seo_analysis"]["seo_score"] = build_on_page_seo_score(
                 website_data
             )
+            logger.info(
+                "gemini.analysis_succeeded model=%s",
+                active_model,
+                extra={
+                    "diagnostic_event": "gemini.analysis_succeeded",
+                    "model": active_model,
+                },
+            )
             return add_semantic_competitor_ranking(validated_result)
 
         except Exception as error:
@@ -1977,25 +1994,35 @@ STRICT OUTPUT RULES:
             error_message = str(error).upper()
             provider_status, safe_error_message = _safe_gemini_exception_details(error)
 
-            temporary_error = any(
-                term in error_message
-                for term in [
-                    "503",
-                    "UNAVAILABLE",
-                    "429",
-                    "RESOURCE_EXHAUSTED",
-                    "500",
-                    "INTERNAL",
-                    "TIMEOUT",
-                    "DEADLINE_EXCEEDED"
-                ]
-            ) or provider_status in {429, 500, 502, 503, 504} or isinstance(error, TimeoutError)
-            retrying = temporary_error and attempt < max_attempts - 1
+            provider_error = not isinstance(error, ExternalServiceError)
+            temporary_error = provider_error and (
+                any(
+                    term in error_message
+                    for term in [
+                        "503",
+                        "UNAVAILABLE",
+                        "429",
+                        "RESOURCE_EXHAUSTED",
+                        "500",
+                        "INTERNAL",
+                        "TIMEOUT",
+                        "DEADLINE_EXCEEDED"
+                    ]
+                )
+                or provider_status in {429, 500, 502, 503, 504}
+                or isinstance(error, TimeoutError)
+            )
+            retrying = (
+                temporary_error
+                and not fallback_model_used
+                and attempt < max_attempts - 1
+            )
             diagnostic = {
                 "diagnostic_event": "gemini.request_failed",
                 "attempt": attempt + 1,
-                "max_attempts": max_attempts,
+                "max_attempts": 1 if fallback_model_used else max_attempts,
                 "retrying": retrying,
+                "model": active_model,
                 "error_type": type(error).__name__,
                 "status_code": provider_status,
                 "error_message": safe_error_message,
@@ -2008,7 +2035,33 @@ STRICT OUTPUT RULES:
 
             if retrying:
                 await asyncio.sleep(min(0.5 * (2 ** attempt), 1.5))
+                attempt += 1
+                continue
 
+            fallback_eligible = provider_error and (
+                provider_status in {429, 502, 503, 504}
+                or isinstance(error, TimeoutError)
+                or any(
+                    marker in error_message
+                    for marker in ("RESOURCE_EXHAUSTED", "TIMEOUT", "DEADLINE_EXCEEDED")
+                )
+            )
+            if not fallback_model_used and fallback_eligible:
+                logger.warning(
+                    "gemini.model_fallback primary_model=%s fallback_model=%s after_attempts=%s",
+                    active_model,
+                    FALLBACK_GEMINI_MODEL,
+                    attempt + 1,
+                    extra={
+                        "diagnostic_event": "gemini.model_fallback",
+                        "primary_model": active_model,
+                        "fallback_model": FALLBACK_GEMINI_MODEL,
+                        "after_attempts": attempt + 1,
+                    },
+                )
+                active_model = FALLBACK_GEMINI_MODEL
+                fallback_model_used = True
+                attempt = 0
                 continue
 
             if isinstance(error, ExternalServiceError):
