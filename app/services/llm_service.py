@@ -1748,8 +1748,11 @@ STRICT OUTPUT RULES:
     query itself: informational (how, what, guide, tips), commercial
     (best, compare, reviews, alternatives), transactional (pricing,
     buy, plans, trial), or navigational (brand/product plus login,
-    support, official or documentation). The relevance explanation
-    must name a topic that also appears in the query and business profile.
+    support, official or documentation). The relevance explanation must
+    repeat a specific category, product or service topic that appears in
+    both the query and the competitor business profile, then explain why
+    the query matches that topic. Do not use a generic statement such as
+    "relevant to this business" as the explanation.
 
 32. Use Facebook, Instagram, LinkedIn or X only for queries that
     explicitly concern social content, posts, campaigns, communities,
@@ -1899,12 +1902,24 @@ STRICT OUTPUT RULES:
                             for field in invalid_fields
                         ],
                     }
+                    relevance_correction = ""
+                    if "target_search_queries[].relevance" in invalid_fields:
+                        relevance_correction = (
+                            " For every query with an invalid relevance field, rewrite that field "
+                            "to repeat a concrete category, product, or service topic present in "
+                            "both that query and competitor_analysis.category or "
+                            "competitor_analysis.products_services, and explain their connection. "
+                            "Do not rely on a generic relevance statement, brand name alone, or "
+                            "platform name alone. Preserve all other query and analysis values."
+                        )
                     prompt += (
                         "\n\nCORRECTIVE RESPONSE REQUIREMENT: Your previous JSON failed "
                         "schema validation. Return a complete corrected JSON object. "
                         "Supply every listed missing field and correct every listed invalid field "
                         "to its expected type/value. Preserve all other required analysis fields. "
-                        "Do not add commentary or Markdown.\n"
+                        "Do not add commentary or Markdown."
+                        + relevance_correction
+                        + "\n"
                         + json.dumps(correction, sort_keys=True, separators=(",", ":"))
                     )
                     logger.warning(
