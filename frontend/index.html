@@ -147,6 +147,7 @@
                         <div>
                             <div class="eyebrow">SEARCH VISIBILITY</div>
                             <h2>SEO Intelligence</h2>
+                            <p class="muted">Keywords, intents, content gaps and recommendations are AI-generated suggestions. Metadata observations come from the fetched page; no search volumes, rankings or traffic estimates are provided.</p>
                         </div>
                     </div>
                     <div class="seo-grid">
@@ -166,6 +167,28 @@
                             <h3>Business Keywords</h3>
                             <div id="businessKeywords" class="tag-list"></div>
                         </div>
+                        <div class="panel">
+                            <h3>Branded Product Names</h3>
+                            <p class="muted">Named products found in the extracted website content.</p>
+                            <div id="brandedProductKeywords" class="tag-list"></div>
+                        </div>
+                    </div>
+                    <div class="seo-grid">
+                        <div class="panel">
+                            <h3>On-page SEO Score</h3>
+                            <div id="seoScore"></div>
+                            <p class="muted">A transparent checklist score from extracted page data; not a Google score, ranking, or traffic estimate.</p>
+                        </div>
+                        <div class="panel">
+                            <h3>Observed Metadata</h3>
+                            <p class="muted">Observed title and description come from the fetched page. Suggestions are AI-generated.</p>
+                            <div id="metadataAnalysis"></div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <h3>Content Gaps & Opportunities</h3>
+                        <p class="muted">AI-generated topics based on the extracted page content; this is not an exhaustive content audit.</p>
+                        <div id="contentGaps" class="keyword-list"></div>
                     </div>
                     <div class="panel">
                         <h3>Target Search Queries</h3>
@@ -186,6 +209,7 @@
                     <div class="panel">
                         <h3>SEO Recommendations</h3>
                         <ul id="seoRecommendations" class="recommendation-list"></ul>
+                        <div id="prioritizedSeoRecommendations" class="keyword-list"></div>
                     </div>
                 </section>
 
@@ -230,6 +254,11 @@
                         <div class="panel">
                             <h3>Customer Needs & Challenges</h3>
                             <ul id="customerNeeds" class="recommendation-list"></ul>
+                        </div>
+                        <div class="panel">
+                            <h3>Audience & Industry Evidence</h3>
+                            <p class="muted">Observed quotes come from extracted page text; interpretations are labelled as AI inferences.</p>
+                            <div id="audienceEvidence" class="keyword-list"></div>
                         </div>
                     </div>
                 </section>

@@ -11,6 +11,7 @@ const statusMessage = document.getElementById("statusMessage");
 const downloadBtn = document.getElementById("downloadBtn");
 
 let latestReport = null;
+let analysisRequestVersion = 0;
 
 // Safely convert values to displayable text.
 function text(value, fallback = "Not available") {
@@ -23,6 +24,10 @@ function text(value, fallback = "Not available") {
     }
 
     return String(value);
+}
+
+function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 // Create DOM elements without inserting untrusted HTML.
@@ -93,6 +98,54 @@ function setLoading(isLoading) {
         statusMessage.textContent = "✦ Connecting to the AI analysis engine...";
     }
 }
+
+function getWebsiteUrlValidationMessage(value) {
+    const url = String(value || "").trim();
+    if (!url) return "Please enter a website URL.";
+
+    try {
+        const parsed = new URL(url);
+        if (["http:", "https:"].includes(parsed.protocol) && parsed.hostname) {
+            return "";
+        }
+    } catch {
+        // Fall through to the same clear message used for malformed URLs.
+    }
+
+    return "Enter a valid HTTP or HTTPS website URL, such as https://example.com.";
+}
+
+function handleUrlInputChange() {
+    const wasLoading = analyzeBtn.disabled;
+    const hadResults = latestReport !== null
+        || !results.classList.contains("hidden")
+        || statusMessage.textContent === "✓ Analysis completed successfully.";
+    const hadError = !errorPanel.classList.contains("hidden");
+    const validationMessage = getWebsiteUrlValidationMessage(urlInput.value);
+
+    urlInput.setCustomValidity(validationMessage);
+    analysisRequestVersion += 1;
+    latestReport = null;
+    results.classList.add("hidden");
+    errorPanel.classList.add("hidden");
+
+    if (wasLoading) setLoading(false);
+
+    if (validationMessage) {
+        showError(validationMessage);
+        statusMessage.textContent = "Please correct the website URL before analysis.";
+    } else if (wasLoading || hadResults || hadError) {
+        statusMessage.textContent = "URL changed. Submit it to analyze the updated website.";
+    }
+}
+
+urlInput.addEventListener("input", handleUrlInputChange);
+urlInput.addEventListener("invalid", () => {
+    const message = getWebsiteUrlValidationMessage(urlInput.value);
+    urlInput.setCustomValidity(message);
+    showError(message);
+    statusMessage.textContent = "Please correct the website URL before analysis.";
+});
 
 function renderWebsite(website) {
     document.getElementById("websiteTitle").textContent =
@@ -402,12 +455,42 @@ function renderDiscoveredCompetitors(items) {
 
 function renderSEO(data) {
     const seo = data.seo_analysis || {};
+    const keywordIntents = seo.keyword_intents || {};
 
-    renderTags("primaryKeywords", seo.primary_keywords);
-    renderTags("secondaryKeywords", seo.secondary_keywords);
-    renderKeywords("longTailKeywords", seo.long_tail_keywords);
-    renderTags("businessKeywords", seo.business_keywords);
-    renderList("seoRecommendations", seo.content_recommendations);
+    renderKeywordGroup("primaryKeywords", seo.primary_keywords, keywordIntents.primary, true);
+    renderKeywordGroup("secondaryKeywords", seo.secondary_keywords, keywordIntents.secondary, true);
+    renderKeywordGroup("longTailKeywords", seo.long_tail_keywords, keywordIntents.long_tail, false);
+    renderKeywordGroup("businessKeywords", seo.business_keywords, keywordIntents.business, true);
+    renderKeywordGroup("brandedProductKeywords", seo.branded_product_keywords, keywordIntents.branded_products, true);
+    renderMetadataAnalysis(seo.metadata_assessment);
+    renderOnPageSeoScore(seo.seo_score);
+    renderContentGaps(seo.content_gaps);
+
+    const legacyRecommendations = document.getElementById("seoRecommendations");
+    const prioritized = Array.isArray(seo.prioritized_recommendations)
+        ? seo.prioritized_recommendations
+        : [];
+    const prioritizedContainer = document.getElementById("prioritizedSeoRecommendations");
+    prioritizedContainer.replaceChildren();
+    if (prioritized.length) {
+        legacyRecommendations.classList.add("hidden");
+        prioritized.forEach(item => {
+            const card = makeElement("div", "keyword-item");
+            card.append(makeElement("strong", "", `${text(item.priority, "Medium")} priority`));
+            card.append(makeElement("p", "", item.recommendation));
+            card.append(makeElement("p", "muted", `Expected benefit: ${text(item.expected_benefit)}`));
+            card.append(makeElement("p", "muted", `Implementation effort: ${text(item.implementation_effort)}`));
+            const relatedLabel = item.related_to === "content_gap"
+                ? `Content opportunity: ${text(item.related_topic)}`
+                : `Observed issue: ${statusLabel(item.related_to || "not available")}`;
+            card.append(makeElement("p", "muted", relatedLabel));
+            prioritizedContainer.append(card);
+        });
+        legacyRecommendations.replaceChildren();
+    } else {
+        legacyRecommendations.classList.remove("hidden");
+        renderList("seoRecommendations", seo.content_recommendations);
+    }
 
     const table = document.getElementById("queryTable");
     table.replaceChildren();
@@ -421,7 +504,7 @@ function renderSEO(data) {
 
         [
             item.query,
-            item.platform,
+            `${text(item.platform)} · ${statusLabel(item.platform_type || "not available")}`,
             item.intent,
             item.relevance
         ].forEach((value, index) => {
@@ -446,6 +529,92 @@ function renderSEO(data) {
         row.append(cell);
         table.append(row);
     }
+}
+
+function renderKeywordGroup(containerId, keywords, intentEntries, useTags) {
+    if (!Array.isArray(intentEntries)) {
+        if (useTags) renderTags(containerId, keywords);
+        else renderKeywords(containerId, keywords);
+        return;
+    }
+
+    const container = document.getElementById(containerId);
+    container.replaceChildren();
+    if (!Array.isArray(keywords) || keywords.length === 0) {
+        container.append(makeElement(useTags ? "span" : "div", useTags ? "tag" : "keyword-item", "Not available"));
+        return;
+    }
+
+    const intents = new Map(intentEntries
+        .filter(item => item && typeof item.keyword === "string")
+        .map(item => [item.keyword.toLocaleLowerCase(), item.intent]));
+    keywords.forEach(keyword => {
+        const intent = intents.get(String(keyword).toLocaleLowerCase());
+        const label = intent
+            ? `${keyword} · Intent: ${statusLabel(intent)}`
+            : keyword;
+        container.append(makeElement(useTags ? "span" : "div", useTags ? "tag" : "keyword-item", label));
+    });
+}
+
+function renderMetadataAnalysis(metadata) {
+    const container = document.getElementById("metadataAnalysis");
+    container.replaceChildren();
+    if (!metadata || typeof metadata !== "object") {
+        container.append(makeElement("p", "muted", "Metadata assessment unavailable."));
+        return;
+    }
+
+    [
+        ["Title tag", metadata.title_tag],
+        ["Meta description", metadata.meta_description],
+    ].forEach(([label, item]) => {
+        const block = makeElement("div", "keyword-item");
+        if (!item || typeof item !== "object") {
+            block.append(makeElement("strong", "", `${label}: unavailable`));
+        } else {
+            block.append(makeElement("strong", "", `${label} · ${statusLabel(item.status)}`));
+            block.append(makeElement("p", "", `Observed (${text(item.character_count, "0")} characters): ${text(item.observed, "Missing")}`));
+            block.append(makeElement("p", "muted", `AI suggestion: ${text(item.suggestion)}`));
+        }
+        container.append(block);
+    });
+}
+
+function renderOnPageSeoScore(score) {
+    const container = document.getElementById("seoScore");
+    container.replaceChildren();
+    if (!score || !Array.isArray(score.components)) {
+        container.append(makeElement("p", "muted", "Score unavailable."));
+        return;
+    }
+
+    container.append(makeElement("h3", "", `${text(score.score, "0")} / ${text(score.max_score, "100")}`));
+    container.append(makeElement("p", "muted", score.methodology));
+    score.components.forEach(component => {
+        container.append(makeElement(
+            "div",
+            "keyword-item",
+            `${component.factor}: ${component.score}/${component.max_score} · ${component.finding}`
+        ));
+    });
+}
+
+function renderContentGaps(items) {
+    const container = document.getElementById("contentGaps");
+    container.replaceChildren();
+    if (!Array.isArray(items) || !items.length) {
+        container.append(makeElement("p", "muted", "No content gaps were suggested from the available page content."));
+        return;
+    }
+
+    items.forEach(item => {
+        const card = makeElement("div", "keyword-item");
+        card.append(makeElement("strong", "", item.topic));
+        card.append(makeElement("p", "", `Why it matters: ${text(item.why_it_matters)}`));
+        card.append(makeElement("p", "muted", `Opportunity: ${text(item.content_opportunity)}`));
+        container.append(card);
+    });
 }
 
 function renderServices(data) {
@@ -508,6 +677,29 @@ function renderAudience(data) {
     renderTags("businessTypes", audience.business_types);
     renderList("customerProfiles", audience.customer_profiles);
     renderList("customerNeeds", audience.needs_and_challenges);
+
+    const evidenceContainer = document.getElementById("audienceEvidence");
+    evidenceContainer.replaceChildren();
+    const evidenceItems = [
+        ...(Array.isArray(audience.industry_segment_evidence) ? audience.industry_segment_evidence : [])
+            .map(item => ({ ...item, field: "industry_segments", claim: item.industry })),
+        ...(Array.isArray(audience.audience_evidence) ? audience.audience_evidence : []),
+    ];
+    if (!evidenceItems.length) {
+        evidenceContainer.append(makeElement("p", "muted", "No audience or industry claims had sufficient extracted-page support."));
+        return;
+    }
+    evidenceItems.forEach(item => {
+        const card = makeElement("div", "keyword-item");
+        const basis = item.basis === "observed" ? "Observed on page" : "AI inference";
+        card.append(makeElement("strong", "", `${text(item.claim)} · ${basis}`));
+        card.append(makeElement("p", "muted", `Field: ${statusLabel(item.field)}`));
+        card.append(makeElement("blockquote", "", item.supporting_text));
+        if (item.basis === "inferred" && item.reason) {
+            card.append(makeElement("p", "muted", `Inference: ${item.reason}`));
+        }
+        evidenceContainer.append(card);
+    });
 }
 
 function renderReport(response) {
@@ -537,55 +729,108 @@ form.addEventListener("submit", async event => {
     event.preventDefault();
 
     const url = urlInput.value.trim();
+    const validationMessage = getWebsiteUrlValidationMessage(url);
 
-    if (!url) {
-        showError("Please enter a website URL.");
+    if (validationMessage) {
+        urlInput.setCustomValidity(validationMessage);
+        showError(validationMessage);
+        statusMessage.textContent = "Please correct the website URL before analysis.";
         return;
     }
 
+    urlInput.setCustomValidity("");
+    const requestVersion = ++analysisRequestVersion;
+    latestReport = null;
     setLoading(true);
 
     try {
-        const response = await fetch(API_URL, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            },
-            body: JSON.stringify({ url })
-        });
+        let response;
+        try {
+            response = await fetch(API_URL, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                body: JSON.stringify({ url })
+            });
+        } catch (error) {
+            const networkError = new Error(
+                "Could not connect to the API. Check your internet connection and API CORS settings."
+            );
+            networkError.name = "NetworkRequestError";
+            throw networkError;
+        }
 
-        const data = await response.json();
+        if (requestVersion !== analysisRequestVersion) return;
+
+        let responseText;
+        try {
+            responseText = await response.text();
+        } catch (error) {
+            throw new Error(`Could not read the API response (HTTP ${response.status}).`);
+        }
+
+        let data = null;
+        if (!responseText.trim() && response.ok) {
+            throw new Error(`The API returned an empty response (HTTP ${response.status}).`);
+        }
+        if (responseText.trim()) {
+            try {
+                data = JSON.parse(responseText);
+            } catch (error) {
+                if (response.ok) {
+                    throw new Error(`The API returned invalid JSON (HTTP ${response.status}).`);
+                }
+            }
+        }
 
         if (!response.ok) {
-            const detail = data.detail;
+            const detail = data?.error?.message || data?.detail;
             const message = typeof detail === "string"
-                ? detail
-                : "The server rejected this request. Check the website URL and try again.";
+                ? `API request failed (HTTP ${response.status}): ${detail}`
+                : `API request failed with HTTP ${response.status}.`;
 
             throw new Error(message);
         }
 
-        if (data.success !== true || !data.analysis) {
+        if (
+            !isRecord(data)
+            || data.success !== true
+            || !isRecord(data.website)
+            || typeof data.website.url !== "string"
+            || typeof data.website.title !== "string"
+            || typeof data.website.meta_description !== "string"
+            || !isRecord(data.analysis)
+            || !isRecord(data.analysis.competitor_analysis)
+            || !Array.isArray(data.analysis.target_search_queries)
+            || !isRecord(data.analysis.seo_analysis)
+            || !Array.isArray(data.analysis.top_services)
+            || !isRecord(data.analysis.target_audience)
+        ) {
             throw new Error("The API returned an unexpected response format.");
         }
 
-        renderReport(data);
+        try {
+            renderReport(data);
+        } catch (error) {
+            results.classList.add("hidden");
+            latestReport = null;
+            console.error("Analysis dashboard rendering failed:", error);
+            throw new Error("The analysis succeeded, but the dashboard could not display the results. Reload the page and try again.");
+        }
 
     } catch (error) {
+        if (requestVersion !== analysisRequestVersion) return;
         console.error("Website analysis failed:", error);
 
         let message = error.message || "Something went wrong.";
-
-        if (error instanceof TypeError) {
-            message = "Could not connect to the API. Check your internet connection and API CORS settings.";
-        }
 
         showError(message);
         statusMessage.textContent = "Analysis could not be completed.";
 
     } finally {
-        setLoading(false);
+        if (requestVersion === analysisRequestVersion) setLoading(false);
     }
 });
 

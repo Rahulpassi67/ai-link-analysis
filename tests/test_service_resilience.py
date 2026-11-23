@@ -278,7 +278,7 @@ def test_gemini_retries_transient_errors_with_a_controlled_retry(monkeypatch):
         type("Client", (), {"models": FakeModels()})()
     )
     monkeypatch.setattr(llm_service, "validate_website_data", lambda data: None)
-    monkeypatch.setattr(llm_service, "validate_analysis", lambda data: VALID_ANALYSIS)
+    monkeypatch.setattr(llm_service, "validate_analysis", lambda data, **_kwargs: VALID_ANALYSIS)
     monkeypatch.setattr(llm_service, "add_semantic_competitor_ranking", lambda data: data)
 
     async def no_sleep(seconds):
