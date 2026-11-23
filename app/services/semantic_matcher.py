@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Lock
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -12,21 +13,24 @@ MODEL_PATH = (
     / "all-MiniLM-L6-v2"
 )
 _model = None
+_model_lock = Lock()
 
 
 def _load_model():
     """Load only the model preloaded into the deployment artifact."""
     global _model
     if _model is None:
-        if not (MODEL_PATH / "modules.json").is_file():
-            raise FileNotFoundError(
-                "The semantic model is not preloaded. Run "
-                "scripts/preload_semantic_model.py during the build."
-            )
-        _model = SentenceTransformer(
-            str(MODEL_PATH),
-            local_files_only=True
-        )
+        with _model_lock:
+            if _model is None:
+                if not (MODEL_PATH / "modules.json").is_file():
+                    raise FileNotFoundError(
+                        "The semantic model is not preloaded. Run "
+                        "scripts/preload_semantic_model.py during the build."
+                    )
+                _model = SentenceTransformer(
+                    str(MODEL_PATH),
+                    local_files_only=True
+                )
     return _model
 
 

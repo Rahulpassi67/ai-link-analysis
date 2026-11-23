@@ -1,4 +1,7 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+from time import sleep
 
 import pytest
 
@@ -21,6 +24,29 @@ def test_semantic_model_loads_only_the_preloaded_local_directory(monkeypatch, tm
 
     assert semantic_matcher._load_model() is sentinel
     assert calls == {"path": str(tmp_path), "local_files_only": True}
+
+
+def test_concurrent_model_loads_share_one_sentence_transformer(monkeypatch, tmp_path):
+    (tmp_path / "modules.json").write_text(json.dumps([]), encoding="utf-8")
+    calls = {"count": 0}
+    calls_lock = Lock()
+    sentinel = object()
+
+    def fake_sentence_transformer(_path, **_kwargs):
+        with calls_lock:
+            calls["count"] += 1
+        sleep(0.03)
+        return sentinel
+
+    monkeypatch.setattr(semantic_matcher, "MODEL_PATH", tmp_path)
+    monkeypatch.setattr(semantic_matcher, "SentenceTransformer", fake_sentence_transformer)
+    monkeypatch.setattr(semantic_matcher, "_model", None)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        models = list(executor.map(lambda _index: semantic_matcher._load_model(), range(8)))
+
+    assert calls["count"] == 1
+    assert all(model is sentinel for model in models)
 
 
 def test_missing_preloaded_model_fails_without_remote_download(monkeypatch, tmp_path):
