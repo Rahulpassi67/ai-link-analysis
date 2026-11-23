@@ -131,7 +131,7 @@ function renderCompetitors(data) {
 
     if (competitors.length === 0) {
         container.append(
-            makeElement("p", "muted", "No verified competitors available.")
+            makeElement("p", "muted", "No AI-suggested competitor claims available.")
         );
         return;
     }
@@ -163,6 +163,239 @@ function renderCompetitors(data) {
         }
 
         card.append(weaknesses);
+        container.append(card);
+    });
+}
+
+
+function formatScore(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "Not available";
+    return `${number.toFixed(2)} / 1.00`;
+}
+
+function safeHttpUrl(value) {
+    if (typeof value !== "string" || !value.trim()) return "";
+    try {
+        const parsed = new URL(value);
+        return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+    } catch {
+        return "";
+    }
+}
+
+function statusLabel(value) {
+    return String(value || "not_available")
+        .replaceAll("_", " ")
+        .replace(/\b\w/g, character => character.toUpperCase());
+}
+
+function renderDiscoveredCompetitors(items) {
+    const container = document.getElementById("discoveredCompetitorList");
+    const summary = document.getElementById("discoverySummary");
+    container.replaceChildren();
+
+    const competitors = Array.isArray(items) ? items : [];
+    summary.textContent = `${competitors.length} potential competitor${competitors.length === 1 ? "" : "s"} discovered`;
+
+    if (!competitors.length) {
+        container.append(makeElement(
+            "p",
+            "muted discovery-empty",
+            "No potential competitors were returned. Check the Tavily configuration or try another website."
+        ));
+        return;
+    }
+
+    competitors.forEach((competitor, index) => {
+        const card = makeElement("article", "discovered-card");
+        const header = makeElement("div", "discovered-card-header");
+        const titleGroup = makeElement("div", "discovered-title-group");
+        titleGroup.append(makeElement("span", "competitor-rank", `#${index + 1}`));
+        titleGroup.append(makeElement("h3", "", competitor.name || "Unnamed competitor"));
+        header.append(titleGroup);
+
+        const typeClass = competitor.competitor_type === "direct"
+            ? "type-direct"
+            : competitor.competitor_type === "indirect"
+                ? "type-indirect"
+                : "type-unclear";
+        const type = makeElement(
+            "span",
+            `type-pill ${typeClass}`,
+            `Evidence label: ${statusLabel(competitor.competitor_type || "unclear")}`
+        );
+        header.append(type);
+        card.append(header);
+
+        if (competitor.description) {
+            card.append(makeElement("p", "discovered-description", competitor.description));
+        }
+        if (competitor.relevance_reason) {
+            card.append(makeElement("p", "candidate-relevance-reason", `Why relevant: ${competitor.relevance_reason}`));
+        }
+        if (competitor.competitor_type_reason) {
+            card.append(makeElement("p", "candidate-type-reason", competitor.competitor_type_reason));
+        }
+        if (
+            competitor.competitor_type === "unclear"
+            && ["direct", "indirect"].includes(competitor.ai_competitor_type)
+        ) {
+            card.append(makeElement(
+                "p",
+                "candidate-ai-type-note",
+                `Gemini suggested ${competitor.ai_competitor_type}; accessible page evidence did not establish that classification.`
+            ));
+        }
+        if (competitor.product_name) {
+            card.append(makeElement("p", "discovered-product", `Product: ${competitor.product_name}`));
+        }
+
+        const metrics = makeElement("div", "discovery-metrics");
+        const similarity = makeElement("div", "discovery-metric");
+        similarity.append(makeElement("span", "metric-label", "Semantic similarity score"));
+        similarity.append(makeElement("strong", "metric-value", formatScore(competitor.similarity_score)));
+        const evidence = makeElement("div", "discovery-metric");
+        evidence.append(makeElement("span", "metric-label", "Heuristic evidence score"));
+        evidence.append(makeElement(
+            "strong",
+            "metric-value",
+            formatScore(competitor.heuristic_evidence_score ?? competitor.evidence_confidence)
+        ));
+        metrics.append(similarity, evidence);
+        card.append(metrics);
+
+        const statusRow = makeElement("div", "evidence-status-row");
+        statusRow.append(makeElement(
+            "span",
+            `evidence-pill ${String(competitor.evidence_strength || "").toLowerCase() === "strong" ? "evidence-strong" : "evidence-limited"}`,
+            `Strength: ${statusLabel(competitor.evidence_strength || "not available")}`
+        ));
+        statusRow.append(makeElement(
+            "span",
+            "status-text",
+            `Status: ${statusLabel(competitor.evidence_status)}`
+        ));
+        card.append(statusRow);
+
+        const checked = Number(competitor.evidence_pages_checked);
+        const accessible = Number(competitor.evidence_pages_accessible);
+        if (Number.isFinite(checked) || Number.isFinite(accessible)) {
+            const pageText = makeElement(
+                "p",
+                "evidence-page-count",
+                `Pages checked: ${Number.isFinite(checked) ? checked : "—"} · Accessible: ${Number.isFinite(accessible) ? accessible : "—"}`
+            );
+            card.append(pageText);
+        }
+
+        const website = safeHttpUrl(competitor.official_website || competitor.url);
+        if (website) {
+            const websiteLink = makeElement("a", "source-link", "Visit website ↗");
+            websiteLink.href = website;
+            websiteLink.target = "_blank";
+            websiteLink.rel = "noopener noreferrer";
+            card.append(websiteLink);
+        }
+
+        const sourceUrls = Array.isArray(competitor.evidence_urls) ? competitor.evidence_urls : [];
+        const details = Array.isArray(competitor.evidence_details) ? competitor.evidence_details : [];
+        const detailUrls = details.map(detail => detail && detail.url).filter(Boolean);
+        const allSources = [...new Set([...sourceUrls, ...detailUrls])]
+            .map(safeHttpUrl)
+            .filter(Boolean);
+
+        if (allSources.length) {
+            const sources = makeElement("div", "evidence-sources");
+            sources.append(makeElement("span", "metric-label", "Evidence sources"));
+            allSources.slice(0, 5).forEach((url, sourceIndex) => {
+                const link = makeElement("a", "", `Source ${sourceIndex + 1} ↗`);
+                link.href = url;
+                link.target = "_blank";
+                link.rel = "noopener noreferrer";
+                sources.append(link);
+            });
+            card.append(sources);
+        }
+
+        if (details.length) {
+            const disclosure = document.createElement("details");
+            disclosure.className = "evidence-details";
+            const disclosureTitle = document.createElement("summary");
+            disclosureTitle.textContent = `Observed webpage evidence (${details.length} page${details.length === 1 ? "" : "s"})`;
+            disclosure.append(disclosureTitle);
+
+            details.slice(0, 8).forEach(detail => {
+                const page = makeElement("div", "evidence-page");
+                const sourceUrl = safeHttpUrl(detail.source_url || detail.url);
+                const sourceTypeLabels = {
+                    official_website: "Official website",
+                    official_website_candidate: "Candidate official site (unverified)",
+                    third_party: "Third-party source",
+                    unverified_source: "Unverified source"
+                };
+                const sourceType = sourceTypeLabels[detail.source_type]
+                    || (detail.is_official_domain ? "Official website" : "Third-party source");
+                const pageHeading = makeElement(
+                    "p",
+                    "evidence-page-heading",
+                    `${detail.accessibility_status === "accessible" ? "Accessible" : "Inaccessible"} · ${sourceType} · ${statusLabel(detail.classification || "no_relevant_evidence")}`
+                );
+                page.append(pageHeading);
+                if (sourceUrl) {
+                    const pageLink = makeElement("a", "evidence-page-link", detail.source_url || detail.url);
+                    pageLink.href = sourceUrl;
+                    pageLink.target = "_blank";
+                    pageLink.rel = "noopener noreferrer";
+                    page.append(pageLink);
+                }
+                if (detail.reason) {
+                    page.append(makeElement("p", "evidence-reason", detail.reason));
+                }
+
+                const excerpts = Array.isArray(detail.excerpts) ? detail.excerpts : [];
+                if (!excerpts.length && detail.accessibility_status === "accessible") {
+                    const duplicateCount = Number(detail.duplicate_excerpts_omitted || 0);
+                    page.append(makeElement(
+                        "p",
+                        "evidence-no-match",
+                        duplicateCount > 0
+                            ? "A repeated excerpt was omitted; matching text is shown with another source above."
+                            : "No relevant text match was found on this accessible page."
+                    ));
+                }
+                excerpts.forEach(excerpt => {
+                    const excerptBlock = makeElement("blockquote", "evidence-excerpt");
+                    excerptBlock.append(makeElement(
+                        "p",
+                        "evidence-excerpt-text",
+                        excerpt.matched_text || ""
+                    ));
+                    excerptBlock.append(makeElement(
+                        "p",
+                        "evidence-excerpt-meta",
+                        `Competitor: ${excerpt.competitor_name || competitor.name || "Unknown"} · ${statusLabel(excerpt.classification || "observed_text")}`
+                    ));
+                    const terms = Array.isArray(excerpt.matching_terms) ? excerpt.matching_terms : [];
+                    if (terms.length) {
+                        excerptBlock.append(makeElement(
+                            "p",
+                            "evidence-excerpt-terms",
+                            `Matched terms: ${terms.join(", ")}`
+                        ));
+                    }
+                    page.append(excerptBlock);
+                });
+                disclosure.append(page);
+            });
+            card.append(disclosure);
+        }
+
+        card.append(makeElement(
+            "p",
+            "discovery-disclaimer",
+            "Quoted text is observed webpage content. Direct/indirect labels require explicit relationship wording on a fetched page; all matching scores remain heuristic signals, not probabilities or proof that businesses compete."
+        ));
         container.append(card);
     });
 }
@@ -283,6 +516,7 @@ function renderReport(response) {
 
     renderWebsite(website);
     renderCompetitors(analysis);
+    renderDiscoveredCompetitors(analysis.discovered_competitors);
     renderSEO(analysis);
     renderServices(analysis);
     renderAudience(analysis);

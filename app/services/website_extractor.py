@@ -1,16 +1,21 @@
 
 import asyncio
 import ipaddress
+import logging
 import socket
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+from app.utils.errors import WebsiteContentError, WebsiteExtractionError
 
 
 MAX_CONTENT_SIZE = 2_000_000
 MIN_CONTENT_LENGTH = 300
-TIMEOUT = 25
+logger = logging.getLogger(__name__)
+
+TIMEOUT = 15
+DNS_TIMEOUT = 5
 
 CHALLENGE_PHRASES = [
     "your request has been blocked",
@@ -124,7 +129,7 @@ async def fetch_with_httpx(url: str):
     current_url = url
 
     async with httpx.AsyncClient(
-        timeout=TIMEOUT,
+        timeout=httpx.Timeout(TIMEOUT),
         follow_redirects=False,
         trust_env=False,
         limits=httpx.Limits(
@@ -136,44 +141,69 @@ async def fetch_with_httpx(url: str):
         for redirect_count in range(6):
             await asyncio.to_thread(validate_url, current_url)
 
-            response = await client.get(
+            async with client.stream(
+                "GET",
                 current_url,
                 headers={
                     "User-Agent": "Mozilla/5.0",
                     "Accept": "text/html,application/xhtml+xml"
                 }
-            )
+            ) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location")
 
-            if response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get("location")
+                    if not location:
+                        raise WebsiteExtractionError(
+                            "invalid_redirect",
+                            "The website returned an invalid redirect.",
+                            502
+                        )
 
-                if not location:
-                    raise ValueError("Website returned an invalid redirect.")
+                    if redirect_count == 5:
+                        raise WebsiteExtractionError(
+                            "too_many_redirects",
+                            "The website redirected too many times.",
+                            502
+                        )
 
-                if redirect_count == 5:
-                    raise ValueError("Too many website redirects.")
+                    current_url = urljoin(str(response.url), location)
+                    continue
 
-                current_url = urljoin(str(response.url), location)
-                continue
+                if response.status_code >= 400:
+                    raise WebsiteExtractionError(
+                        "website_http_error",
+                        f"The target website returned HTTP {response.status_code}.",
+                        502
+                    )
 
-            if response.status_code >= 400:
-                raise ValueError(
-                    f"Website returned HTTP {response.status_code}."
-                )
+                content_type = response.headers.get("content-type", "")
+                if "text/html" not in content_type.lower():
+                    raise WebsiteExtractionError(
+                        "not_html",
+                        "The submitted URL did not return an HTML webpage.",
+                        422
+                    )
 
-            if len(response.content) > MAX_CONTENT_SIZE:
-                raise ValueError("Website content is too large.")
+                declared_size = response.headers.get("content-length")
+                if declared_size and declared_size.isdigit() and int(declared_size) > MAX_CONTENT_SIZE:
+                    raise WebsiteExtractionError(
+                        "website_too_large",
+                        "The website response exceeds the allowed size.",
+                        413
+                    )
 
-            content_type = response.headers.get("content-type", "")
-
-            if "text/html" not in content_type.lower():
-                raise ValueError("The URL does not contain an HTML webpage.")
-
-            return extract_html(
-                response.text,
-                str(response.url),
-                "httpx"
-            )
+                content = bytearray()
+                async for chunk in response.aiter_bytes():
+                    content.extend(chunk)
+                    if len(content) > MAX_CONTENT_SIZE:
+                        raise WebsiteExtractionError(
+                            "website_too_large",
+                            "The website response exceeds the allowed size.",
+                            413
+                        )
+                encoding = response.encoding or "utf-8"
+                html = bytes(content).decode(encoding, errors="replace")
+                return extract_html(html, str(response.url), "httpx")
 
         raise ValueError("Unable to follow website redirects.")
 
@@ -183,9 +213,10 @@ async def fetch_with_playwright(url: str):
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        raise ValueError(
-            "Playwright is not installed. Run: "
-            "python3 -m pip install playwright"
+        raise WebsiteExtractionError(
+            "browser_fallback_unavailable",
+            "The page needs browser rendering, but the browser fallback is unavailable.",
+            503
         )
 
     await asyncio.to_thread(validate_url, url)
@@ -263,56 +294,98 @@ async def extract_website_content(url: str):
     Extract website content using HTTPX first,
     then Playwright if JavaScript rendering is needed.
     """
-    await asyncio.to_thread(validate_url, url)
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(validate_url, url),
+            timeout=DNS_TIMEOUT
+        )
+    except asyncio.TimeoutError as error:
+        raise WebsiteExtractionError(
+            "website_dns_timeout",
+            "The website domain lookup timed out.",
+            504
+        ) from error
 
     try:
-        result = await fetch_with_httpx(url)
+        result = await asyncio.wait_for(
+            fetch_with_httpx(url),
+            timeout=TIMEOUT + 2
+        )
 
         # Do not use browser rendering to bypass security challenges.
         if is_security_challenge(
             result["title"], result["content"]
         ):
-            raise ValueError(
+            raise WebsiteExtractionError(
+                "website_security_challenge",
                 "Website returned a security challenge. "
-                "Automated extraction is not permitted."
+                "Automated extraction is not permitted.",
+                422
             )
 
         if len(result["content"]) >= MIN_CONTENT_LENGTH:
             return result
 
-        print("Static extraction returned little content. Trying Playwright...")
+        logger.info("Static extraction returned limited content; using browser fallback.")
+
+    except WebsiteExtractionError:
+        raise
 
     except ValueError as error:
         if "security challenge" in str(error).lower():
             raise
-        print("HTTP extraction issue:", error)
+        logger.warning("Website extraction validation failed (%s).", type(error).__name__)
 
     except httpx.RequestError as error:
-        print("HTTP request issue:", error)
+        logger.warning("Static website request failed (%s).", type(error).__name__)
+
+    except asyncio.TimeoutError:
+        logger.warning("Static website request timed out.")
+        # A single bounded browser fallback remains useful for JS-heavy pages.
 
     # Use Playwright for JavaScript-rendered websites.
     try:
-        result = await fetch_with_playwright(url)
+        result = await asyncio.wait_for(
+            fetch_with_playwright(url),
+            timeout=TIMEOUT + 5
+        )
 
         if is_security_challenge(
             result["title"], result["content"]
         ):
-            raise ValueError(
+            raise WebsiteExtractionError(
+                "website_security_challenge",
                 "Website returned a security challenge. "
-                "Automated extraction is not permitted."
+                "Automated extraction is not permitted.",
+                422
             )
 
         if len(result["content"]) < MIN_CONTENT_LENGTH:
-            raise ValueError(
+            raise WebsiteContentError(
                 "Not enough website content could be extracted."
             )
 
         return result
 
-    except ValueError:
+    except WebsiteExtractionError:
         raise
 
-    except Exception as error:
-        raise ValueError(
-            f"Website extraction failed: {str(error)}"
+    except ValueError:
+        raise WebsiteContentError(
+            "The website did not provide enough usable content for analysis."
         )
+
+    except asyncio.TimeoutError as error:
+        raise WebsiteExtractionError(
+            "website_timeout",
+            "The website extraction timed out.",
+            504
+        ) from error
+
+    except Exception as error:
+        logger.warning("Browser website extraction failed (%s).", type(error).__name__)
+        raise WebsiteExtractionError(
+            "website_extraction_failed",
+            "The website could not be extracted. Check that it is publicly accessible and try again.",
+            502
+        ) from error

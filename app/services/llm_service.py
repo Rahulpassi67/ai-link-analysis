@@ -2,12 +2,21 @@
 
 import asyncio
 import json
+import logging
 import re
 
 from google import genai
 from google.genai import types
 
-from app.config import GEMINI_API_KEY, GEMINI_MODEL
+from app.config import ConfigurationError, GEMINI_API_KEY, GEMINI_MODEL
+from app.utils.errors import (
+    ExternalServiceError,
+    WebsiteContentError,
+    classify_external_error,
+)
+
+logger = logging.getLogger(__name__)
+GEMINI_REQUEST_TIMEOUT = 20
 
 
 # ============================================================
@@ -15,7 +24,13 @@ from app.config import GEMINI_API_KEY, GEMINI_MODEL
 # ============================================================
 
 if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            timeout=GEMINI_REQUEST_TIMEOUT * 1000,
+            retry_options=types.HttpRetryOptions(attempts=1)
+        )
+    )
 else:
     client = None
 
@@ -490,6 +505,84 @@ def validate_analysis(result: dict) -> dict:
 # 6. MAIN GEMINI ANALYSIS FUNCTION
 # ============================================================
 
+def add_semantic_competitor_ranking(analysis: dict) -> dict:
+    """
+    Rank Gemini-generated competitor suggestions by semantic
+    relevance to the analyzed brand.
+
+    If the ML matcher fails, preserve the original Gemini output.
+    """
+    competitors = analysis.get(
+        "competitor_analysis", {}
+    ).get("competitors", [])
+
+    if not competitors:
+        return analysis
+
+    try:
+        # Import lazily so an ML issue cannot prevent API startup.
+        from app.services.semantic_matcher import rank_similar_items
+
+        brand = analysis["competitor_analysis"]
+
+        query_parts = [
+            brand.get("brand_name", ""),
+            brand.get("category", ""),
+            brand.get("overview", ""),
+        ]
+
+        query_parts.extend(
+            item for item in brand.get("products_services", [])
+            if isinstance(item, str)
+        )
+
+        query = " ".join(query_parts).strip()
+
+        if not query:
+            return analysis
+
+        candidate_texts = []
+        candidate_lookup = {}
+
+        for competitor in competitors:
+            description = (
+                f"{competitor.get('name', '')}. "
+                f"Strengths: "
+                f"{', '.join(competitor.get('strengths', []))}. "
+                f"Weaknesses: "
+                f"{', '.join(competitor.get('weaknesses', []))}"
+            )
+
+            candidate_texts.append(description)
+            candidate_lookup[description] = competitor
+
+        ranked = rank_similar_items(query, candidate_texts)
+
+        ranked_competitors = []
+
+        for item in ranked:
+            description = item.get("description")
+            original = candidate_lookup.get(description)
+
+            if original is None:
+                continue
+
+            competitor = dict(original)
+            competitor["similarity_score"] = round(
+                float(item["similarity_score"]), 4
+            )
+
+            ranked_competitors.append(competitor)
+
+        if ranked_competitors:
+            brand["competitors"] = ranked_competitors
+
+    except Exception as error:
+        # Never break the working Gemini analysis if ML ranking fails.
+        logger.warning("Semantic competitor ranking failed (%s).", type(error).__name__)
+
+    return analysis
+
 async def analyze_with_ai(website_data: dict) -> dict:
     """
     Analyze extracted website information using Google Gemini.
@@ -506,13 +599,16 @@ async def analyze_with_ai(website_data: dict) -> dict:
     """
 
     if client is None:
-        raise ValueError(
-            "GEMINI_API_KEY is missing. "
-            "Configure it in your environment."
+        raise ConfigurationError(
+            "GEMINI_API_KEY is not configured. "
+            "Set it in the environment or .env file."
         )
 
     # Validate website content BEFORE AI analysis.
-    validate_website_data(website_data)
+    try:
+        validate_website_data(website_data)
+    except ValueError as error:
+        raise WebsiteContentError(str(error)) from error
 
     prompt = f"""
 You are an expert business analyst, competitor researcher,
@@ -702,19 +798,24 @@ STRICT OUTPUT RULES:
 
         try:
 
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.2
-                )
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2
+                    )
+                ),
+                timeout=GEMINI_REQUEST_TIMEOUT + 3
             )
 
             if not response.text:
-                raise ValueError(
-                    "Gemini returned an empty response."
+                raise ExternalServiceError(
+                    "gemini_empty_response",
+                    "Gemini returned an empty analysis response.",
+                    502
                 )
 
             response_text = response.text.strip()
@@ -727,20 +828,29 @@ STRICT OUTPUT RULES:
                 flags=re.IGNORECASE
             ).strip()
 
+
             # Parse JSON.
-            result = json.loads(response_text)
+            try:
+                result = json.loads(response_text)
+            except json.JSONDecodeError as error:
+                raise ExternalServiceError(
+                    "gemini_invalid_response",
+                    "Gemini returned an invalid analysis response. Please try again.",
+                    502
+                ) from error
 
             # Validate all sections and fields.
-            return validate_analysis(result)
+            try:
+                validated_result = validate_analysis(result)
+            except ValueError as error:
+                raise ExternalServiceError(
+                    "gemini_invalid_response",
+                    "Gemini returned an incomplete analysis response. Please try again.",
+                    502
+                ) from error
 
-        except json.JSONDecodeError as error:
-
-            raise ValueError(
-                f"Gemini returned invalid JSON: {error}"
-            ) from error
-
-        except ValueError:
-            raise
+            # Add ML-based competitor ranking.
+            return add_semantic_competitor_ranking(validated_result)
 
         except Exception as error:
 
@@ -758,23 +868,29 @@ STRICT OUTPUT RULES:
                     "TIMEOUT",
                     "DEADLINE_EXCEEDED"
                 ]
-            )
+            ) or isinstance(error, TimeoutError)
 
             if (
                 temporary_error
                 and attempt < max_attempts - 1
             ):
 
-                await asyncio.sleep(
-                    2 ** (attempt + 1)
+                logger.warning(
+                    "Gemini request failed with a retryable error (%s); retry %s/%s.",
+                    type(error).__name__,
+                    attempt + 1,
+                    max_attempts - 1
                 )
+                await asyncio.sleep(min(0.5 * (2 ** attempt), 1.5))
 
                 continue
 
-            raise ValueError(
-                f"Gemini analysis failed: {error}"
-            ) from error
+            if isinstance(error, ExternalServiceError):
+                raise
+            raise classify_external_error("Gemini", error) from error
 
-    raise ValueError(
-        "Gemini analysis failed after multiple attempts."
+    raise ExternalServiceError(
+        "gemini_unavailable",
+        "Gemini could not complete the analysis after multiple attempts.",
+        503
     )

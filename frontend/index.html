@@ -121,8 +121,20 @@
                         </div>
                     </div>
                     <div class="panel">
-                        <h3>Competitors</h3>
+                        <h3>AI-Suggested Competitors</h3>
+                        <p class="muted competitor-claims-note">These are Gemini-generated claims and are not independently verified by the webpage evidence below.</p>
                         <div id="competitorList" class="competitor-list"></div>
+                    </div>
+                    <div class="panel discovery-panel">
+                        <div class="discovery-heading">
+                            <div>
+                                <h3>AI-Discovered Competitors</h3>
+                                <p class="muted">Tavily candidates are checked against cited search text and fetched webpages. Direct/indirect labels stay unclear unless a page explicitly supports the relationship.</p>
+                            </div>
+                            <span id="discoverySummary" class="discovery-count">0 potential competitors</span>
+                        </div>
+                        <div id="discoveredCompetitorList" class="discovered-competitor-list"></div>
+                        <p class="discovery-footnote">Expand observed webpage evidence to inspect matched text and sources. Direct/indirect labels require explicit relationship wording on a fetched page. Similarity and heuristic evidence values are scores, not statistical probabilities or proof that businesses compete.</p>
                     </div>
                     <div class="panel">
                         <h3>Brand Advantages</h3>
