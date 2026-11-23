@@ -291,7 +291,7 @@ def test_gemini_retries_transient_errors_with_a_controlled_retry(monkeypatch):
     assert calls["count"] == 2
 
 
-def test_gemini_quota_errors_are_sanitized_after_bounded_retries(monkeypatch):
+def test_gemini_quota_errors_log_sanitized_details_after_bounded_retries(monkeypatch, caplog):
     calls = {"count": 0}
 
     class FakeModels:
@@ -310,12 +310,62 @@ def test_gemini_quota_errors_are_sanitized_after_bounded_retries(monkeypatch):
         return None
 
     monkeypatch.setattr(llm_service.asyncio, "sleep", no_sleep)
-    with pytest.raises(ExternalServiceError) as raised:
-        asyncio.run(llm_service.analyze_with_ai({"content": "ignored"}))
+    with caplog.at_level("WARNING", logger="app.services.llm_service"):
+        with pytest.raises(ExternalServiceError) as raised:
+            asyncio.run(llm_service.analyze_with_ai({"content": "ignored"}))
 
     assert calls["count"] == 3
     assert raised.value.status_code == 503
     assert "DO_NOT_EXPOSE" not in str(raised.value)
+    request_failures = [
+        record for record in caplog.records
+        if getattr(record, "diagnostic_event", None) == "gemini.request_failed"
+    ]
+    assert len(request_failures) == 3
+    assert request_failures[0].status_code == 429
+    assert "quota key=[REDACTED]" in request_failures[0].error_message
+    assert request_failures[-1].retrying is False
+    assert "DO_NOT_EXPOSE" not in caplog.text
+
+
+def test_exhausted_gemini_server_errors_return_a_clear_service_error(monkeypatch, caplog):
+    calls = {"count": 0}
+
+    class FakeServerError(Exception):
+        status_code = 503
+        message = "upstream temporarily unavailable"
+
+    class FakeModels:
+        def generate_content(self, **_kwargs):
+            calls["count"] += 1
+            raise FakeServerError(FakeServerError.message)
+
+    monkeypatch.setattr(
+        llm_service,
+        "client",
+        type("Client", (), {"models": FakeModels()})()
+    )
+    monkeypatch.setattr(llm_service, "validate_website_data", lambda _data: None)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(llm_service.asyncio, "sleep", no_sleep)
+    with caplog.at_level("WARNING", logger="app.services.llm_service"):
+        with pytest.raises(ExternalServiceError) as raised:
+            asyncio.run(llm_service.analyze_with_ai({"content": "ignored"}))
+
+    assert calls["count"] == 3
+    assert raised.value.code == "gemini_unavailable"
+    assert raised.value.status_code == 503
+    assert "temporarily unavailable after multiple attempts" in raised.value.public_message
+    assert any(
+        getattr(record, "diagnostic_event", None) == "gemini.request_failed"
+        and record.status_code == 503
+        and record.error_message == "upstream temporarily unavailable"
+        and record.retrying is False
+        for record in caplog.records
+    )
 
 
 def test_all_tavily_queries_failing_becomes_a_safe_service_error(monkeypatch):

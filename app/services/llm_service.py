@@ -19,6 +19,36 @@ logger = logging.getLogger(__name__)
 GEMINI_REQUEST_TIMEOUT = 20
 
 
+def _safe_gemini_exception_details(error: Exception) -> tuple[int | None, str]:
+    """Return useful provider diagnostics with credentials and tokens removed."""
+    status_code = None
+    for candidate in (
+        getattr(error, "status_code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+        getattr(error, "code", None),
+    ):
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and 100 <= candidate <= 599:
+            status_code = candidate
+            break
+
+    raw_message = getattr(error, "message", None)
+    message = raw_message if isinstance(raw_message, str) and raw_message else str(error)
+    if status_code is None:
+        status_match = re.search(r"\b([1-5]\d{2})\b", message)
+        if status_match:
+            status_code = int(status_match.group(1))
+
+    message = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[REDACTED]", message)
+    message = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", message)
+    message = re.sub(
+        r"(?i)([\"']?(?:api[_ -]?key|key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|authorization|password)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}]+",
+        r"\1[REDACTED]",
+        message,
+    )
+    message = " ".join(message.split())[:500]
+    return status_code, message or "No provider error message was available."
+
+
 # ============================================================
 # 1. INITIALIZE GEMINI CLIENT
 # ============================================================
@@ -1945,6 +1975,7 @@ STRICT OUTPUT RULES:
         except Exception as error:
 
             error_message = str(error).upper()
+            provider_status, safe_error_message = _safe_gemini_exception_details(error)
 
             temporary_error = any(
                 term in error_message
@@ -1958,26 +1989,38 @@ STRICT OUTPUT RULES:
                     "TIMEOUT",
                     "DEADLINE_EXCEEDED"
                 ]
-            ) or isinstance(error, TimeoutError)
+            ) or provider_status in {429, 500, 502, 503, 504} or isinstance(error, TimeoutError)
+            retrying = temporary_error and attempt < max_attempts - 1
+            diagnostic = {
+                "diagnostic_event": "gemini.request_failed",
+                "attempt": attempt + 1,
+                "max_attempts": max_attempts,
+                "retrying": retrying,
+                "error_type": type(error).__name__,
+                "status_code": provider_status,
+                "error_message": safe_error_message,
+            }
+            logger.warning(
+                "gemini.request_failed %s",
+                json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+                extra=diagnostic,
+            )
 
-            if (
-                temporary_error
-                and attempt < max_attempts - 1
-            ):
-
-                logger.warning(
-                    "Gemini request failed with a retryable error (%s); retry %s/%s.",
-                    type(error).__name__,
-                    attempt + 1,
-                    max_attempts - 1
-                )
+            if retrying:
                 await asyncio.sleep(min(0.5 * (2 ** attempt), 1.5))
 
                 continue
 
             if isinstance(error, ExternalServiceError):
                 raise
-            raise classify_external_error("Gemini", error) from error
+            classified_error = classify_external_error("Gemini", error)
+            if temporary_error and classified_error.code == "gemini_unavailable":
+                raise ExternalServiceError(
+                    "gemini_unavailable",
+                    "Gemini is temporarily unavailable after multiple attempts. Please try again later.",
+                    503,
+                ) from error
+            raise classified_error from error
 
     raise ExternalServiceError(
         "gemini_unavailable",
