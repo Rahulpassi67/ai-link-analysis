@@ -1030,7 +1030,7 @@ async def discover_competitors(
     """
     Discover potential competitors using Tavily,
     extract companies using Gemini, validate evidence,
-    and rank using Sentence Transformers.
+    and rank using TF-IDF cosine similarity.
     """
 
     api_key = require_api_key("TAVILY_API_KEY")
@@ -1433,7 +1433,7 @@ async def discover_competitors(
         return []
     final_candidates = deduplicate_competitor_excerpts(final_candidates)
 
-    # 8. Rank company descriptions using Sentence Transformers.
+    # 8. Rank company descriptions using TF-IDF cosine similarity.
     try:
         from app.services.semantic_matcher import rank_similar_items
 

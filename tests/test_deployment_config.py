@@ -4,11 +4,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_render_blueprint_uses_paid_service_preloads_model_and_keeps_tavily_optional():
+def test_render_blueprint_uses_lightweight_similarity_and_keeps_tavily_optional():
     render = (ROOT / "render.yaml").read_text(encoding="utf-8")
 
     assert "plan: 1c-2g" in render
-    assert "buildCommand: pip install -r requirements.txt && python -m scripts.preload_semantic_model" in render
+    assert "buildCommand: pip install -r requirements.txt" in render
+    assert "preload_semantic_model" not in render
     assert "healthCheckPath: /health" in render
     assert "startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT" in render
     assert "- key: GEMINI_API_KEY\n        sync: false" in render

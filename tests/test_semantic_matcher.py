@@ -1,69 +1,49 @@
-import json
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
-from time import sleep
-
-import pytest
-
 from app.services import llm_service, semantic_matcher
 
 
-def test_semantic_model_loads_only_the_preloaded_local_directory(monkeypatch, tmp_path):
-    (tmp_path / "modules.json").write_text(json.dumps([]), encoding="utf-8")
-    calls = {}
-    sentinel = object()
+def test_get_embeddings_returns_tfidf_vectors_for_nonempty_text():
+    vectors = semantic_matcher.get_embeddings([
+        "online commerce platform",
+        "online store platform",
+    ])
 
-    def fake_sentence_transformer(path, **kwargs):
-        calls["path"] = path
-        calls.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(semantic_matcher, "MODEL_PATH", tmp_path)
-    monkeypatch.setattr(semantic_matcher, "SentenceTransformer", fake_sentence_transformer)
-    monkeypatch.setattr(semantic_matcher, "_model", None)
-
-    assert semantic_matcher._load_model() is sentinel
-    assert calls == {"path": str(tmp_path), "local_files_only": True}
+    assert vectors.shape[0] == 2
+    assert vectors.nnz > 0
 
 
-def test_concurrent_model_loads_share_one_sentence_transformer(monkeypatch, tmp_path):
-    (tmp_path / "modules.json").write_text(json.dumps([]), encoding="utf-8")
-    calls = {"count": 0}
-    calls_lock = Lock()
-    sentinel = object()
+def test_similarity_scores_and_candidate_ranking_are_preserved():
+    assert semantic_matcher.calculate_similarity(
+        "online commerce platform",
+        "online commerce platform",
+    ) == 1.0
+    assert semantic_matcher.calculate_similarity("online commerce", "sailing boats") == 0.0
 
-    def fake_sentence_transformer(_path, **_kwargs):
-        with calls_lock:
-            calls["count"] += 1
-        sleep(0.03)
-        return sentinel
+    ranked = semantic_matcher.rank_similar_items(
+        "online commerce platform",
+        ["sailing boats", "online commerce store platform"],
+    )
 
-    monkeypatch.setattr(semantic_matcher, "MODEL_PATH", tmp_path)
-    monkeypatch.setattr(semantic_matcher, "SentenceTransformer", fake_sentence_transformer)
-    monkeypatch.setattr(semantic_matcher, "_model", None)
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        models = list(executor.map(lambda _index: semantic_matcher._load_model(), range(8)))
-
-    assert calls["count"] == 1
-    assert all(model is sentinel for model in models)
+    assert [item["description"] for item in ranked] == [
+        "online commerce store platform",
+        "sailing boats",
+    ]
+    assert all(set(item) == {"description", "similarity_score"} for item in ranked)
+    assert all(0.0 <= item["similarity_score"] <= 1.0 for item in ranked)
 
 
-def test_missing_preloaded_model_fails_without_remote_download(monkeypatch, tmp_path):
-    def unexpected_download(*_args, **_kwargs):
-        raise AssertionError("Model loading must not access the remote hub at request time.")
-
-    monkeypatch.setattr(semantic_matcher, "MODEL_PATH", tmp_path / "missing-model")
-    monkeypatch.setattr(semantic_matcher, "SentenceTransformer", unexpected_download)
-    monkeypatch.setattr(semantic_matcher, "_model", None)
-
-    with pytest.raises(FileNotFoundError, match="preloaded"):
-        semantic_matcher._load_model()
+def test_empty_or_unusable_text_returns_zero_similarity():
+    assert semantic_matcher.get_embeddings([]) == []
+    assert semantic_matcher.calculate_similarity("", "commerce") == 0.0
+    assert semantic_matcher.calculate_similarity("the and a", "!!!") == 0.0
+    assert semantic_matcher.rank_similar_items("", ["commerce"]) == []
+    assert semantic_matcher.rank_similar_items("commerce", [" ", None]) == []
 
 
-def test_model_loading_failure_preserves_gemini_analysis(monkeypatch, tmp_path):
-    monkeypatch.setattr(semantic_matcher, "MODEL_PATH", tmp_path / "missing-model")
-    monkeypatch.setattr(semantic_matcher, "_model", None)
+def test_similarity_failure_preserves_gemini_analysis(monkeypatch):
+    def fail_ranking(*_args, **_kwargs):
+        raise RuntimeError("TF-IDF scoring unavailable")
+
+    monkeypatch.setattr(semantic_matcher, "rank_similar_items", fail_ranking)
     analysis = {
         "competitor_analysis": {
             "brand_name": "Shopify",

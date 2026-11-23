@@ -1,6 +1,6 @@
 # Linkly AI
 
-Linkly AI analyzes a public website and returns structured business, SEO, product/service, audience, and competitor insights. It uses FastAPI, Gemini, Tavily, HTTPX, BeautifulSoup, and Sentence Transformers. The frontend is served by the same FastAPI app.
+Linkly AI analyzes a public website and returns structured business, SEO, product/service, audience, and competitor insights. It uses FastAPI, Gemini, Tavily, HTTPX, BeautifulSoup, and scikit-learn TF-IDF similarity. The frontend is served by the same FastAPI app.
 
 ## Local setup
 
@@ -58,13 +58,13 @@ python -m pytest -v
 
 ## Deploy to Render
 
-The repository includes a Render Blueprint in `render.yaml`. Create a Blueprint from the repository in Render and provide `GEMINI_API_KEY` when prompted. `TAVILY_API_KEY` is optional; add it in the Render service's Environment settings only if competitor search is enabled. `GEMINI_MODEL` defaults to `gemini-3.8-flash`. The Blueprint uses Python 3.12, installs pinned production dependencies, preloads the pinned Sentence Transformers model into the deployment artifact, starts Uvicorn on Render's `$PORT`, and checks `/health`.
+The repository includes a Render Blueprint in `render.yaml`. Create a Blueprint from the repository in Render and provide `GEMINI_API_KEY` when prompted. `TAVILY_API_KEY` is optional; add it in the Render service's Environment settings only if competitor search is enabled. `GEMINI_MODEL` defaults to `gemini-3.8-flash`. The Blueprint uses Python 3.12, installs pinned production dependencies, starts Uvicorn on Render's `$PORT`, and checks `/health`. Competitor similarity uses local TF-IDF vectors and does not download or load a language model.
 
 For a manual Web Service setup, use:
 
 - **Runtime:** Python 3.12
-- **Plan:** Paid always-on service with at least 2 GB RAM for the ML dependency/model workload
-- **Build command:** `pip install -r requirements.txt && python -m scripts.preload_semantic_model`
+- **Plan:** Paid always-on service sized for the API workload
+- **Build command:** `pip install -r requirements.txt`
 - **Start command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - **Health check path:** `/health`
 
