@@ -30,7 +30,7 @@ Open <http://127.0.0.1:4000/> for the dashboard, <http://127.0.0.1:4000/health> 
 |---|---|---|
 | `GEMINI_API_KEY` | Yes, for analysis | Authenticates Gemini website analysis and competitor extraction. |
 | `TAVILY_API_KEY` | No, optional competitor discovery | Authenticates competitor web search. |
-| `GEMINI_MODEL` | No | Gemini model identifier; defaults to `gemini-3.8-flash`. |
+| `GEMINI_MODEL` | No | Primary Gemini model identifier; defaults to `gemini-3.5-flash-lite`. The fallback is `gemini-3.1-flash-lite`. |
 
 Missing provider keys raise a clear configuration error when analysis is requested (HTTP 503). They do not prevent app imports, the dashboard, or `/health` from working.
 
@@ -58,7 +58,7 @@ python -m pytest -v
 
 ## Deploy to Render
 
-The repository includes a Render Blueprint in `render.yaml`. Create a Blueprint from the repository in Render and provide `GEMINI_API_KEY` when prompted. `TAVILY_API_KEY` is optional; add it in the Render service's Environment settings only if competitor search is enabled. `GEMINI_MODEL` defaults to `gemini-3.8-flash`. The Blueprint uses Python 3.12, installs pinned production dependencies, starts Uvicorn on Render's `$PORT`, and checks `/health`. Competitor similarity uses local TF-IDF vectors and does not download or load a language model.
+The repository includes a Render Blueprint in `render.yaml`. Create a Blueprint from the repository in Render and provide `GEMINI_API_KEY` when prompted. `TAVILY_API_KEY` is optional; add it in the Render service's Environment settings only if competitor search is enabled. `GEMINI_MODEL` defaults to `gemini-3.5-flash-lite`, with `gemini-3.1-flash-lite` as fallback. The Blueprint uses Python 3.12, installs pinned production dependencies, starts Uvicorn on Render's `$PORT`, and checks `/health`. Competitor similarity uses local TF-IDF vectors and does not download or load a language model.
 
 For a manual Web Service setup, use:
 

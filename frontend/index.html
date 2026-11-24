@@ -41,7 +41,8 @@
             </div>
         </aside>
 
-        <main class="main-content" id="overview">
+        <main class="main-content">
+            <section id="overview" class="dashboard-view">
             <header class="topbar">
                 <div>
                     <div class="eyebrow">AI WEBSITE INTELLIGENCE</div>
@@ -83,8 +84,10 @@
             </div>
 
             <div class="error-panel hidden" id="errorPanel" role="alert"></div>
+            </section>
 
             <section id="results" class="hidden">
+                <div class="overview-result">
                 <div class="section-heading">
                     <div>
                         <div class="eyebrow">ANALYSIS RESULTS</div>
@@ -101,8 +104,9 @@
                         <p id="websiteDescription"></p>
                     </div>
                 </div>
+                </div>
 
-                <section class="content-section" id="competitors">
+                <section class="content-section hidden" id="competitors">
                     <div class="section-heading">
                         <div>
                             <div class="eyebrow">MARKET POSITION</div>
@@ -142,7 +146,7 @@
                     </div>
                 </section>
 
-                <section class="content-section" id="seo">
+                <section class="content-section hidden" id="seo">
                     <div class="section-heading">
                         <div>
                             <div class="eyebrow">SEARCH VISIBILITY</div>
@@ -213,7 +217,7 @@
                     </div>
                 </section>
 
-                <section class="content-section" id="services">
+                <section class="content-section hidden" id="services">
                     <div class="section-heading">
                         <div>
                             <div class="eyebrow">BUSINESS OFFERINGS</div>
@@ -223,7 +227,7 @@
                     <div id="servicesGrid" class="services-grid"></div>
                 </section>
 
-                <section class="content-section" id="audience">
+                <section class="content-section hidden" id="audience">
                     <div class="section-heading">
                         <div>
                             <div class="eyebrow">CUSTOMER INTELLIGENCE</div>
@@ -271,6 +275,6 @@
         </main>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=section-navigation-1"></script>
 </body>
 </html>

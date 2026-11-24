@@ -11,7 +11,7 @@ load_dotenv()
 # unrelated modules remain available when a provider is not configured.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or None
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY") or None
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 
 class ConfigurationError(ServiceError):

@@ -3,6 +3,7 @@ import pytest
 from app.services.llm_service import (
     build_metadata_assessment,
     build_on_page_seo_score,
+    consolidate_service_audience_evidence,
     filter_supported_industry_segments,
     ground_audience_claims,
     validate_search_queries,
@@ -140,6 +141,43 @@ def test_search_platforms_distinguish_social_from_search_engine_and_check_cues()
         validate_search_queries(invalid, profile, source)
 
 
+def test_invalid_search_relevance_is_repaired_or_query_is_omitted():
+    profile = {
+        "brand_name": "Shopify",
+        "category": "ecommerce platform",
+        "products_services": ["online store"],
+    }
+    source = {
+        "title": "Shopify ecommerce platform social content",
+        "content": "Shopify supports social content for online stores.",
+    }
+    queries = [
+        {
+            "query": "How Shopify ecommerce platform supports social content",
+            "platform": "Instagram",
+            "platform_type": "social_network",
+            "intent": "informational",
+            "relevance": "Relevant to this business.",
+            "target_audience": "online merchants",
+        },
+        {
+            "query": "How Acme supports social content",
+            "platform": "LinkedIn",
+            "platform_type": "social_network",
+            "intent": "informational",
+            "relevance": "Relevant to this business.",
+            "target_audience": "online merchants",
+        },
+    ]
+
+    result = validate_search_queries(queries, profile, source)
+
+    assert len(result) == 1
+    assert result[0]["relevance"] == (
+        "The query mentions ecommerce, a topic listed in the business profile."
+    )
+
+
 def test_industry_segments_require_relevant_page_evidence():
     website = {"content": "Shopify ecommerce platform helps merchants create an online store and sell products."}
     industries, evidence = filter_supported_industry_segments(
@@ -249,6 +287,155 @@ def test_validated_audience_evidence_populates_empty_fields():
     assert [item["basis"] for item in result["audience_evidence"]] == [
         "observed", "inferred", "observed"
     ]
+
+
+def test_inferred_audience_claim_needs_shared_terms_with_its_source_quote():
+    website = {
+        "content": "HubSpot marketing automation helps small marketing teams manage campaigns."
+    }
+    audience = {
+        "primary_audience": "Not available",
+        "secondary_audience": "Not available",
+        "business_types": [],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [
+            {
+                "field": "primary_audience",
+                "claim": "small marketing teams",
+                "basis": "inferred",
+                "supporting_text": "HubSpot marketing automation helps small marketing teams",
+                "reason": "The page describes the product as helping these teams manage campaigns.",
+            },
+            {
+                "field": "secondary_audience",
+                "claim": "enterprise finance departments",
+                "basis": "inferred",
+                "supporting_text": "HubSpot marketing automation helps small marketing teams",
+                "reason": "This audience may use business software.",
+            },
+        ],
+    }
+
+    result = ground_audience_claims(audience, website)
+
+    assert result["primary_audience"] == "small marketing teams"
+    assert result["secondary_audience"] == "Not available"
+    assert [item["basis"] for item in result["audience_evidence"]] == ["inferred"]
+
+
+def test_service_customer_and_industry_evidence_populates_audience_fields():
+    website = {
+        "content": (
+            "Marketing Hub helps marketing professionals plan campaigns. "
+            "Sales Hub supports sales teams. "
+            "HubSpot serves B2B software companies. "
+            "Startups, small businesses and enterprise teams use HubSpot."
+        )
+    }
+    audience = {
+        "primary_audience": "Not available",
+        "secondary_audience": "Not available",
+        "industry_segments": [],
+        "industry_segment_evidence": [],
+        "business_types": ["Startups", "small businesses", "enterprise teams"],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [],
+    }
+    services = [
+        {
+            "name": "Marketing Hub",
+            "description": "Campaign planning tools",
+            "target_customer": "Marketing Professionals",
+            "target_industry": "B2B software companies",
+            "inferred": False,
+        },
+        {
+            "name": "Sales Hub",
+            "description": "Sales team tools",
+            "target_customer": "Sales Teams",
+            "target_industry": "B2B software companies",
+            "inferred": False,
+        },
+        {
+            "name": "Suggested Finance Hub",
+            "description": "Finance tools",
+            "target_customer": "Finance teams",
+            "target_industry": "Financial services",
+            "inferred": True,
+        },
+    ]
+
+    consolidate_service_audience_evidence(audience, services, website)
+    audience["industry_segments"], audience["industry_segment_evidence"] = (
+        filter_supported_industry_segments(
+            audience["industry_segments"],
+            audience["industry_segment_evidence"],
+            website,
+        )
+    )
+    result = ground_audience_claims(audience, website)
+
+    assert result["primary_audience"] == "Marketing Professionals"
+    assert result["secondary_audience"] == "Sales Teams"
+    assert result["industry_segments"] == ["B2B software companies"]
+    assert "Marketing Professionals" in result["customer_profiles"]
+    assert "Startups" in result["customer_profiles"]
+    assert "Sales Teams" in result["recommended_marketing_segments"]
+    assert "Finance teams" not in result["customer_profiles"]
+    assert {item["basis"] for item in result["audience_evidence"]} == {"observed"}
+
+
+def test_repeated_audience_evidence_is_merged_without_losing_fields_or_provenance():
+    quote = "HubSpot supports marketing professionals."
+    website = {"content": quote}
+    audience = {
+        "primary_audience": "marketing professionals",
+        "secondary_audience": "Not available",
+        "business_types": [],
+        "customer_profiles": ["marketing professionals"],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": ["marketing professionals"],
+        "audience_evidence": [
+            {
+                "field": field,
+                "claim": "marketing professionals",
+                "basis": "observed",
+                "supporting_text": quote,
+                "reason": "",
+            }
+            for field in (
+                "primary_audience",
+                "customer_profiles",
+                "recommended_marketing_segments",
+            )
+        ] + [{
+            "field": "recommended_marketing_segments",
+            "claim": "marketing professionals",
+            "basis": "inferred",
+            "supporting_text": quote,
+            "reason": "This is an AI inference from the described product use.",
+        }],
+    }
+
+    result = ground_audience_claims(audience, website)
+
+    assert len(result["audience_evidence"]) == 2
+    observed = next(item for item in result["audience_evidence"] if item["basis"] == "observed")
+    assert observed["field"] == (
+        "primary_audience, customer_profiles, recommended_marketing_segments"
+    )
+    assert observed["supporting_text"] == quote
+    assert any(item["basis"] == "inferred" for item in result["audience_evidence"])
 
 
 def test_industry_evidence_populates_empty_segment_field():

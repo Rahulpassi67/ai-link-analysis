@@ -1,9 +1,14 @@
 
 
 import asyncio
+import copy
+import hashlib
 import json
 import logging
 import re
+import threading
+import time
+from collections import OrderedDict
 
 from google import genai
 from google.genai import types
@@ -18,7 +23,16 @@ from app.utils.errors import (
 logger = logging.getLogger(__name__)
 GEMINI_REQUEST_TIMEOUT = 20
 PRIMARY_GEMINI_MODEL = "gemini-3.5-flash-lite"
-FALLBACK_GEMINI_MODEL = "gemini-3.8-flash"
+FALLBACK_GEMINI_MODEL = "gemini-3.1-flash-lite"
+ANALYSIS_CACHE_TTL_SECONDS = 900
+ANALYSIS_CACHE_MAX_ENTRIES = 64
+GEMINI_RATE_LIMIT_COOLDOWN_SECONDS = 60
+GEMINI_TRANSIENT_COOLDOWN_SECONDS = 15
+_GEMINI_STATE_LOCK = threading.Lock()
+_ANALYSIS_CACHE: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+_ANALYSIS_INFLIGHT: dict[str, asyncio.Task] = {}
+_GEMINI_COOLDOWN_UNTIL = 0.0
+_GEMINI_COOLDOWN_REASON = ""
 
 
 def _safe_gemini_exception_details(error: Exception) -> tuple[int | None, str]:
@@ -49,6 +63,112 @@ def _safe_gemini_exception_details(error: Exception) -> tuple[int | None, str]:
     )
     message = " ".join(message.split())[:500]
     return status_code, message or "No provider error message was available."
+
+
+def _gemini_rate_limit_error(error: Exception) -> bool:
+    status_code, message = _safe_gemini_exception_details(error)
+    return status_code == 429 or "RESOURCE_EXHAUSTED" in message.upper()
+
+
+def activate_gemini_cooldown(error: Exception) -> float:
+    """Briefly suppress fresh provider calls after rate limits or outages."""
+    global _GEMINI_COOLDOWN_UNTIL, _GEMINI_COOLDOWN_REASON
+    status_code, message = _safe_gemini_exception_details(error)
+    if _gemini_rate_limit_error(error):
+        duration = GEMINI_RATE_LIMIT_COOLDOWN_SECONDS
+        reason = "gemini_rate_limited"
+    elif (
+        status_code in {502, 503, 504}
+        or isinstance(error, TimeoutError)
+        or any(marker in message.upper() for marker in ("TIMEOUT", "DEADLINE_EXCEEDED"))
+    ):
+        duration = GEMINI_TRANSIENT_COOLDOWN_SECONDS
+        reason = "gemini_temporarily_unavailable"
+    else:
+        return 0.0
+
+    with _GEMINI_STATE_LOCK:
+        _GEMINI_COOLDOWN_UNTIL = max(
+            _GEMINI_COOLDOWN_UNTIL,
+            time.monotonic() + duration,
+        )
+        _GEMINI_COOLDOWN_REASON = reason
+        return max(0.0, _GEMINI_COOLDOWN_UNTIL - time.monotonic())
+
+
+def gemini_cooldown_remaining() -> tuple[float, str]:
+    with _GEMINI_STATE_LOCK:
+        remaining = max(0.0, _GEMINI_COOLDOWN_UNTIL - time.monotonic())
+        return remaining, _GEMINI_COOLDOWN_REASON if remaining else ""
+
+
+def _analysis_cache_key(website_data: dict) -> str:
+    serialized = json.dumps(
+        website_data,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+async def _run_and_cache_analysis(key: str, website_data: dict) -> dict:
+    try:
+        result = await _analyze_with_ai_uncached(website_data)
+        with _GEMINI_STATE_LOCK:
+            _ANALYSIS_CACHE[key] = (
+                time.monotonic() + ANALYSIS_CACHE_TTL_SECONDS,
+                copy.deepcopy(result),
+            )
+            _ANALYSIS_CACHE.move_to_end(key)
+            while len(_ANALYSIS_CACHE) > ANALYSIS_CACHE_MAX_ENTRIES:
+                _ANALYSIS_CACHE.popitem(last=False)
+        return result
+    finally:
+        with _GEMINI_STATE_LOCK:
+            if _ANALYSIS_INFLIGHT.get(key) is asyncio.current_task():
+                _ANALYSIS_INFLIGHT.pop(key, None)
+
+
+async def analyze_with_ai(website_data: dict) -> dict:
+    """Coalesce identical page analyses and cache successful results briefly."""
+    website_url = website_data.get("url") if isinstance(website_data, dict) else None
+    if not isinstance(website_url, str) or not website_url:
+        return await _analyze_with_ai_uncached(website_data)
+
+    key = _analysis_cache_key(website_data)
+    now = time.monotonic()
+    with _GEMINI_STATE_LOCK:
+        cached = _ANALYSIS_CACHE.get(key)
+        if cached:
+            expires_at, value = cached
+            if expires_at > now:
+                _ANALYSIS_CACHE.move_to_end(key)
+                return copy.deepcopy(value)
+            _ANALYSIS_CACHE.pop(key, None)
+
+        remaining = max(0.0, _GEMINI_COOLDOWN_UNTIL - now)
+        if remaining:
+            reason = _GEMINI_COOLDOWN_REASON
+            if reason == "gemini_rate_limited":
+                raise ExternalServiceError(
+                    reason,
+                    "Gemini is temporarily rate limited. Please try again shortly.",
+                    503,
+                )
+            raise ExternalServiceError(
+                reason or "gemini_temporarily_unavailable",
+                "Gemini is temporarily unavailable. Please try again shortly.",
+                503,
+            )
+
+        task = _ANALYSIS_INFLIGHT.get(key)
+        if task is None:
+            task = asyncio.create_task(_run_and_cache_analysis(key, website_data))
+            _ANALYSIS_INFLIGHT[key] = task
+
+    return copy.deepcopy(await asyncio.shield(task))
 
 
 # ============================================================
@@ -627,12 +747,12 @@ def validate_search_queries(
     brand_name = str(competitor_profile.get("brand_name", ""))
     products = competitor_profile.get("products_services", [])
     products = [item for item in products if isinstance(item, str)] if isinstance(products, list) else []
-    profile_text = " ".join([
-        brand_name,
-        str(competitor_profile.get("category", "")),
-        *products,
-    ])
-    anchor_tokens = set(_normalize_keyword(profile_text).split()) - KEYWORD_STOP_WORDS
+    profile_topics = [
+        topic.strip()
+        for topic in [str(competitor_profile.get("category", "")), *products]
+        if topic.strip()
+    ]
+    anchor_tokens = set(_normalize_keyword(" ".join(profile_topics)).split()) - KEYWORD_STOP_WORDS
     source_text = _source_text(website_data)
     social_cues = {
         "social", "post", "posts", "content", "campaign", "community",
@@ -645,6 +765,7 @@ def validate_search_queries(
         "navigational": r"\b(?:login|log\s*in|sign\s*in|official|support|documentation|docs)\b",
     }
 
+    retained_queries = []
     for item in queries:
         # platform_type is an additive response field. Its value is
         # deterministic for supported platforms, so older valid Gemini output
@@ -693,12 +814,34 @@ def validate_search_queries(
         query_tokens = set(_normalize_keyword(query).split()) - KEYWORD_STOP_WORDS
         overlap = query_tokens & anchor_tokens
         rationale_tokens = set(_normalize_keyword(item["relevance"]).split())
-        if not overlap or not (overlap & rationale_tokens):
-            raise ValueError("Search query relevance is not supported by its topic and rationale.")
         if source_text and not (query_tokens & set(_normalize_keyword(source_text).split())):
             raise ValueError("Search query is not relevant to extracted website content.")
-        item["relevance_level"] = "high" if len(overlap) >= 2 else "medium"
 
+        if not overlap:
+            # A query with no shared profile topic cannot be given a grounded
+            # relevance explanation, so omit just that query.
+            continue
+        if not (overlap & rationale_tokens):
+            matching_topics = [
+                topic for topic in profile_topics
+                if set(_normalize_keyword(topic).split()) & query_tokens
+            ]
+            topic = max(
+                matching_topics,
+                key=lambda value: len(set(_normalize_keyword(value).split()) & query_tokens),
+            )
+            shared_terms = [
+                word for word in re.findall(r"[A-Za-z0-9]+", topic)
+                if _normalize_keyword(word) in query_tokens
+                and _normalize_keyword(word) not in KEYWORD_STOP_WORDS
+            ][:4]
+            item["relevance"] = (
+                f"The query mentions {' '.join(shared_terms)}, a topic listed in the business profile."
+            )
+        item["relevance_level"] = "high" if len(overlap) >= 2 else "medium"
+        retained_queries.append(item)
+
+    queries[:] = retained_queries
     return queries
 
 
@@ -1069,6 +1212,168 @@ def filter_supported_industry_segments(
     return clean_industries, clean_evidence
 
 
+def _service_audience_evidence(
+    claim: str,
+    context: str,
+    field: str,
+    website_data: dict | None,
+) -> dict | None:
+    """Ground a service-derived audience claim in exact page text."""
+    claim = re.sub(r"\s*\(inferred\)\s*$", "", claim.strip(), flags=re.IGNORECASE)
+    if not claim or claim.casefold() == "not available":
+        return None
+
+    source_text = _source_text(website_data)
+    quote = _find_source_quote(claim, source_text)
+    basis = "observed"
+    reason = "The extracted page directly names this audience or industry."
+    if not quote:
+        claim_tokens = set(_normalize_keyword(claim).split()) - KEYWORD_STOP_WORDS
+        context_tokens = set(_normalize_keyword(context).split()) - KEYWORD_STOP_WORDS
+        if not claim_tokens or not context_tokens:
+            return None
+
+        source_segments = []
+        if isinstance(website_data, dict):
+            source_parts = [
+                website_data.get("title", ""),
+                website_data.get("meta_description", ""),
+                website_data.get("content", ""),
+            ]
+            headings = website_data.get("headings", [])
+            if isinstance(headings, list):
+                source_parts.extend(headings)
+            for part in source_parts:
+                if isinstance(part, str):
+                    source_segments.extend(
+                        segment.strip()
+                        for segment in re.split(r"(?<=[.!?])\s+|[\r\n]+", part)
+                        if segment.strip()
+                    )
+
+        for segment in source_segments:
+            segment_tokens = set(_normalize_keyword(segment).split()) - KEYWORD_STOP_WORDS
+            claim_overlap = claim_tokens & segment_tokens
+            context_overlap = context_tokens & segment_tokens
+            if claim_overlap and context_overlap:
+                quote = segment
+                break
+        if not quote:
+            return None
+        basis = "inferred"
+        reason = (
+            "This audience is inferred from the page's description of the related product or service."
+        )
+
+    return {
+        "field": field,
+        "claim": claim,
+        "basis": basis,
+        "supporting_text": quote,
+        "reason": reason,
+    }
+
+
+def consolidate_service_audience_evidence(
+    audience: dict,
+    services: list,
+    website_data: dict | None,
+) -> dict:
+    """Reuse grounded customer and industry evidence already extracted for services."""
+    evidence_items = audience.setdefault("audience_evidence", [])
+    industry_evidence = audience.setdefault("industry_segment_evidence", [])
+    customer_candidates = []
+    industry_candidates = []
+
+    if isinstance(services, list):
+        for service in services:
+            if not isinstance(service, dict) or service.get("inferred") is True:
+                continue
+            name = str(service.get("name", ""))
+            description = str(service.get("description", ""))
+            context = " ".join((name, description))
+
+            customer = service.get("target_customer")
+            if isinstance(customer, str) and customer.strip():
+                candidate = customer.strip()
+                evidence = _service_audience_evidence(
+                    candidate, context, "customer_profiles", website_data
+                )
+                if evidence:
+                    customer_candidates.append((candidate, context, evidence))
+
+            industry = service.get("target_industry")
+            if isinstance(industry, str) and industry.strip():
+                evidence = _service_audience_evidence(
+                    industry, context, "industry_segments", website_data
+                )
+                if evidence:
+                    industry_candidates.append((evidence["claim"], evidence))
+
+    service_customer_count = len(customer_candidates)
+    # Business types are useful audience profiles only when the page itself
+    # supports them; keep them separate from industry classifications.
+    for business_type in audience.get("business_types", []):
+        if not isinstance(business_type, str):
+            continue
+        evidence = _service_audience_evidence(
+            business_type,
+            " ".join(str(service.get("name", "")) for service in services if isinstance(service, dict)),
+            "customer_profiles",
+            website_data,
+        )
+        if evidence:
+            customer_candidates.append((business_type, "", evidence))
+
+    def append_unique(items: list, item: dict, key_fields: tuple[str, ...]) -> None:
+        key = tuple(_normalize_keyword(item.get(field, "")) for field in key_fields)
+        if not any(
+            tuple(_normalize_keyword(existing.get(field, "")) for field in key_fields) == key
+            for existing in items if isinstance(existing, dict)
+        ):
+            items.append(item)
+
+    for claim, _, evidence in customer_candidates:
+        for field in ("customer_profiles", "recommended_marketing_segments"):
+            field_evidence = {**evidence, "field": field}
+            append_unique(evidence_items, field_evidence, ("field", "claim"))
+
+    # Prefer recurring service customer descriptions for audience priority;
+    # use business types only when no grounded service customer is available.
+    primary_candidates = customer_candidates[:service_customer_count]
+    if not primary_candidates:
+        primary_candidates = customer_candidates
+    ranked_customers = []
+    for claim, _, evidence in primary_candidates:
+        key = _normalize_keyword(claim)
+        match = next((item for item in ranked_customers if item[0] == key), None)
+        if match:
+            match[1] += 1
+        else:
+            ranked_customers.append([key, 1, claim, evidence])
+    ranked_customers.sort(key=lambda item: -item[1])
+    for field, rank in (("primary_audience", 0), ("secondary_audience", 1)):
+        if rank < len(ranked_customers):
+            _, _, claim, evidence = ranked_customers[rank]
+            append_unique(evidence_items, {**evidence, "field": field}, ("field", "claim"))
+
+    for claim, evidence in industry_candidates:
+        append_unique(industry_evidence, {
+            "industry": claim,
+            "basis": evidence["basis"],
+            "supporting_text": evidence["supporting_text"],
+            "reason": evidence["reason"],
+        }, ("industry",))
+        if not any(
+            isinstance(existing, str)
+            and _normalize_keyword(existing) == _normalize_keyword(claim)
+            for existing in audience.get("industry_segments", [])
+        ):
+            audience.setdefault("industry_segments", []).append(claim)
+
+    return audience
+
+
 def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
     """Map only audience claims backed by validated website evidence."""
     allowed_fields = {
@@ -1104,7 +1409,17 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
             continue
         if basis == "inferred" and not reason.strip():
             continue
-        valid_evidence.setdefault((field, _normalize_keyword(claim)), {
+        if basis == "inferred":
+            claim_tokens = set(_normalize_keyword(claim).split()) - KEYWORD_STOP_WORDS
+            quote_tokens = set(_normalize_keyword(quote).split()) - KEYWORD_STOP_WORDS
+            if not claim_tokens.intersection(quote_tokens):
+                continue
+        valid_evidence.setdefault((
+            field,
+            _normalize_keyword(claim),
+            basis,
+            quote.strip(),
+        ), {
             "field": field,
             "claim": claim.strip(),
             "basis": basis,
@@ -1121,12 +1436,15 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
         for claim in claims:
             if not isinstance(claim, str) or not claim.strip():
                 continue
-            key = (field, _normalize_keyword(claim))
-            if key in valid_evidence:
+            normalized_claim = _normalize_keyword(claim)
+            if any(
+                evidence_field == field and evidence_claim == normalized_claim
+                for evidence_field, evidence_claim, _, _ in valid_evidence
+            ):
                 continue
             quote = _find_source_quote(claim, source_text)
             if quote and claim.casefold() != "not available":
-                valid_evidence[key] = {
+                valid_evidence[(field, normalized_claim, "observed", quote)] = {
                     "field": field,
                     "claim": claim.strip(),
                     "basis": "observed",
@@ -1138,13 +1456,17 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
         value = audience[field]
         evidence_claims = [
             evidence["claim"]
-            for (evidence_field, _), evidence in valid_evidence.items()
+            for (evidence_field, _, _, _), evidence in valid_evidence.items()
             if evidence_field == field
         ]
         if isinstance(value, list):
             supported_claims = [
                 claim for claim in value
-                if (field, _normalize_keyword(claim)) in valid_evidence
+                if any(
+                    evidence_field == field
+                    and evidence_claim == _normalize_keyword(claim)
+                    for evidence_field, evidence_claim, _, _ in valid_evidence
+                )
             ]
             seen_claims = {_normalize_keyword(claim) for claim in supported_claims}
             for claim in evidence_claims:
@@ -1154,14 +1476,38 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
                     seen_claims.add(normalized_claim)
             audience[field] = supported_claims
         elif value.strip() and value.casefold() != "not available":
-            key = (field, _normalize_keyword(value))
-            if key not in valid_evidence:
+            normalized_value = _normalize_keyword(value)
+            if not any(
+                evidence_field == field and evidence_claim == normalized_value
+                for evidence_field, evidence_claim, _, _ in valid_evidence
+            ):
                 audience[field] = evidence_claims[0] if evidence_claims else "Not available"
         elif evidence_claims:
             audience[field] = evidence_claims[0]
         else:
             audience[field] = "Not available"
-    audience["audience_evidence"] = list(valid_evidence.values())
+    deduplicated_evidence = {}
+    for evidence in valid_evidence.values():
+        key = (
+            _normalize_keyword(evidence["claim"]),
+            evidence["basis"],
+            evidence["supporting_text"].strip(),
+        )
+        existing = deduplicated_evidence.get(key)
+        if existing is None:
+            deduplicated_evidence[key] = dict(evidence)
+            continue
+
+        fields = existing["field"].split(", ")
+        if evidence["field"] not in fields:
+            fields.append(evidence["field"])
+            existing["field"] = ", ".join(fields)
+        reasons = [reason for reason in existing["reason"].split("\n") if reason]
+        if evidence["reason"] and evidence["reason"] not in reasons:
+            reasons.append(evidence["reason"])
+            existing["reason"] = "\n".join(reasons)
+
+    audience["audience_evidence"] = list(deduplicated_evidence.values())
     return audience
 
 
@@ -1403,6 +1749,7 @@ def validate_analysis(result: dict, website_data: dict | None = None) -> dict:
             field
         )
 
+    consolidate_service_audience_evidence(audience, services, website_data)
     audience["industry_segments"], audience["industry_segment_evidence"] = (
         filter_supported_industry_segments(
             audience["industry_segments"],
@@ -1512,7 +1859,7 @@ def add_semantic_competitor_ranking(analysis: dict) -> dict:
 
     return analysis
 
-async def analyze_with_ai(website_data: dict) -> dict:
+async def _analyze_with_ai_uncached(website_data: dict) -> dict:
     """
     Analyze extracted website information using Google Gemini.
 
@@ -1780,11 +2127,12 @@ STRICT OUTPUT RULES:
     query itself: informational (how, what, guide, tips), commercial
     (best, compare, reviews, alternatives), transactional (pricing,
     buy, plans, trial), or navigational (brand/product plus login,
-    support, official or documentation). The relevance explanation must
-    repeat a specific category, product or service topic that appears in
-    both the query and the competitor business profile, then explain why
-    the query matches that topic. Do not use a generic statement such as
-    "relevant to this business" as the explanation.
+    support, official or documentation). Write relevance as one concise
+    sentence (about 8–16 words) that repeats an exact category, product
+    or service topic appearing in both the query and the competitor
+    business profile, then explains how the query relates to it. Use the
+    same topic wording as the query and profile. Do not use a generic
+    statement such as "relevant to this business" as the explanation.
 
 32. Use Facebook, Instagram, LinkedIn or X only for queries that
     explicitly concern social content, posts, campaigns, communities,
@@ -1796,10 +2144,20 @@ STRICT OUTPUT RULES:
     quoted from extracted website text, and reason. Do not emit an
     industry without a source quote; observed labels must appear in it.
 
-34. Ground every target-audience claim with an audience_evidence item
+34. Populate primary_audience, secondary_audience, industry_segments,
+    customer_profiles, business_types and recommended_marketing_segments
+    by examining the extracted page's products, services, business types
+    and customer descriptions. For CRM, marketing, sales or customer
+    service businesses, consider the specific teams, roles, company sizes
+    or industries described on the page; do not assume these segments from
+    the brand or product category alone. Ground every claim with an
+    audience_evidence item
     containing field, claim, basis (observed or inferred), supporting_text
-    quoted from the extracted page, and reason. Mark interpretations as
-    inferred and do not emit unsupported generic audience claims.
+    quoted from the extracted page, and reason. Mark directly stated
+    groups as observed. Mark interpretations as inferred and explain the
+    page evidence linking the group to the product or service. Use
+    "Not available" or an empty list where the page does not support a
+    useful audience claim; do not emit unsupported generic audience claims.
 
 35. Industry and audience evidence supporting_text must be copied from
     the supplied extracted website text; do not invent or rewrite quotes.
@@ -1818,7 +2176,7 @@ STRICT OUTPUT RULES:
     # 7. GEMINI API WITH RETRIES
     # ========================================================
 
-    max_attempts = 3
+    max_attempts = 2
     schema_correction_used = False
     active_model = PRIMARY_GEMINI_MODEL
     fallback_model_used = False
@@ -1944,9 +2302,9 @@ STRICT OUTPUT RULES:
                     if "target_search_queries[].relevance" in invalid_fields:
                         relevance_correction = (
                             " For every query with an invalid relevance field, rewrite that field "
-                            "to repeat a concrete category, product, or service topic present in "
-                            "both that query and competitor_analysis.category or "
-                            "competitor_analysis.products_services, and explain their connection. "
+                            "as one concise sentence that repeats the exact category, product, or "
+                            "service topic present in both that query and competitor_analysis.category "
+                            "or competitor_analysis.products_services, then explains their connection. "
                             "Do not rely on a generic relevance statement, brand name alone, or "
                             "platform name alone. Preserve all other query and analysis values."
                         )
@@ -1995,6 +2353,18 @@ STRICT OUTPUT RULES:
             provider_status, safe_error_message = _safe_gemini_exception_details(error)
 
             provider_error = not isinstance(error, ExternalServiceError)
+            rate_limited = provider_error and _gemini_rate_limit_error(error)
+            if rate_limited:
+                cooldown = activate_gemini_cooldown(error)
+                logger.warning(
+                    "gemini.cooldown_activated reason=gemini_rate_limited seconds=%.0f",
+                    cooldown,
+                    extra={
+                        "diagnostic_event": "gemini.cooldown_activated",
+                        "reason": "gemini_rate_limited",
+                        "cooldown_seconds": round(cooldown),
+                    },
+                )
             temporary_error = provider_error and (
                 any(
                     term in error_message
@@ -2014,6 +2384,7 @@ STRICT OUTPUT RULES:
             )
             retrying = (
                 temporary_error
+                and not rate_limited
                 and not fallback_model_used
                 and attempt < max_attempts - 1
             )
@@ -2039,14 +2410,28 @@ STRICT OUTPUT RULES:
                 continue
 
             fallback_eligible = provider_error and (
-                provider_status in {429, 502, 503, 504}
-                or isinstance(error, TimeoutError)
-                or any(
-                    marker in error_message
-                    for marker in ("RESOURCE_EXHAUSTED", "TIMEOUT", "DEADLINE_EXCEEDED")
+                not rate_limited
+                and (
+                    provider_status in {502, 503, 504}
+                    or isinstance(error, TimeoutError)
+                    or any(
+                        marker in error_message
+                        for marker in ("TIMEOUT", "DEADLINE_EXCEEDED")
+                    )
                 )
             )
             if not fallback_model_used and fallback_eligible:
+                cooldown = activate_gemini_cooldown(error)
+                if cooldown:
+                    logger.warning(
+                        "gemini.cooldown_activated reason=gemini_temporarily_unavailable seconds=%.0f",
+                        cooldown,
+                        extra={
+                            "diagnostic_event": "gemini.cooldown_activated",
+                            "reason": "gemini_temporarily_unavailable",
+                            "cooldown_seconds": round(cooldown),
+                        },
+                    )
                 logger.warning(
                     "gemini.model_fallback primary_model=%s fallback_model=%s after_attempts=%s",
                     active_model,
@@ -2066,6 +2451,8 @@ STRICT OUTPUT RULES:
 
             if isinstance(error, ExternalServiceError):
                 raise
+            if temporary_error:
+                activate_gemini_cooldown(error)
             classified_error = classify_external_error("Gemini", error)
             if temporary_error and classified_error.code == "gemini_unavailable":
                 raise ExternalServiceError(

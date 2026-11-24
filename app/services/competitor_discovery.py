@@ -12,7 +12,12 @@ from urllib.parse import urlparse
 from tavily import TavilyClient
 
 from app.config import require_api_key
-from app.services.llm_service import client as gemini_client, GEMINI_MODEL
+from app.services.llm_service import (
+    activate_gemini_cooldown,
+    client as gemini_client,
+    GEMINI_MODEL,
+    gemini_cooldown_remaining,
+)
 from app.utils.company_names import (
     company_name_matches_text,
     normalize_company_name,
@@ -271,7 +276,7 @@ Return valid JSON only in this format:
 }}
 """
 
-    max_attempts = 3
+    max_attempts = 2
 
     for attempt in range(max_attempts):
         try:
@@ -363,6 +368,17 @@ Return valid JSON only in this format:
                 ))
             )
 
+            rate_limited = (
+                "429" in error_message
+                or "RESOURCE_EXHAUSTED" in error_message
+                or "RATE_LIMIT" in error_message
+                or "429" in error_code
+                or "RESOURCE_EXHAUSTED" in error_code
+                or "RATE_LIMIT" in error_code
+            )
+            if rate_limited:
+                activate_gemini_cooldown(exc)
+
             logger.warning(
                 "Gemini company extraction failed (%s) on attempt %s/%s%s.",
                 type(exc).__name__,
@@ -374,10 +390,12 @@ Return valid JSON only in this format:
                 "gemini_extraction_failed", level="warning",
                 error_type=type(exc).__name__, error_code=_safe_error_code(exc),
                 attempt=attempt + 1, max_attempts=max_attempts,
-                retrying=bool(retryable and attempt < max_attempts - 1)
+                retrying=bool(
+                    retryable and not rate_limited and attempt < max_attempts - 1
+                )
             )
 
-            if retryable and attempt < max_attempts - 1:
+            if retryable and not rate_limited and attempt < max_attempts - 1:
                 await asyncio.sleep(min(0.5 * (2 ** attempt), 1.5))
                 continue
 
@@ -1033,6 +1051,15 @@ async def discover_competitors(
     and rank using TF-IDF cosine similarity.
     """
 
+    cooldown_seconds, cooldown_reason = gemini_cooldown_remaining()
+    if cooldown_seconds:
+        analysis["competitor_discovery_status"] = {
+            "status": "unavailable",
+            "message": "Optional competitor discovery was skipped while Gemini is temporarily limited.",
+        }
+        _log_discovery_summary(0, reason=cooldown_reason or "gemini_cooldown")
+        return []
+
     api_key = require_api_key("TAVILY_API_KEY")
 
     profile = analysis.get("competitor_analysis", {})
@@ -1159,22 +1186,38 @@ async def discover_competitors(
         _log_discovery_summary(0, reason="no_unique_search_results")
         return []
 
-    # 3. Extract company names using Gemini.
+    # 3. Extract candidates from deterministic website names first. Their
+    #    existing evidence verification still decides whether they qualify.
     gemini_fallback_used = False
-    try:
-        companies = await extract_companies_with_gemini(profile, unique_results)
-    except ExternalServiceError as error:
-        gemini_fallback_used = True
-        companies = fallback_candidates_from_search_results(profile, unique_results)
+    companies = fallback_candidates_from_search_results(profile, unique_results)
+    if companies:
         _log_diagnostic(
-            "gemini_fallback_candidates_created",
-            error_type=type(error).__name__, error_code=error.code,
+            "company_candidates_extracted", method="python_tavily_evidence",
             candidate_count=len(companies)
         )
-        analysis["competitor_discovery_status"] = {
-            "status": "partial",
-            "message": "Gemini extraction was unavailable; Tavily candidates are being verified."
-        }
+    else:
+        try:
+            companies = await extract_companies_with_gemini(profile, unique_results)
+        except ExternalServiceError as error:
+            gemini_fallback_used = True
+            cooldown_seconds, cooldown_reason = gemini_cooldown_remaining()
+            if error.code == "gemini_rate_limited" or cooldown_reason == "gemini_rate_limited":
+                analysis["competitor_discovery_status"] = {
+                    "status": "unavailable",
+                    "message": "Optional competitor discovery was skipped because Gemini is temporarily rate limited.",
+                }
+                _log_discovery_summary(0, reason="gemini_rate_limited", error_code=error.code)
+                return []
+            companies = fallback_candidates_from_search_results(profile, unique_results)
+            _log_diagnostic(
+                "gemini_fallback_candidates_created",
+                error_type=type(error).__name__, error_code=error.code,
+                candidate_count=len(companies)
+            )
+            analysis["competitor_discovery_status"] = {
+                "status": "partial",
+                "message": "Gemini extraction was unavailable; Tavily candidates are being verified."
+            }
 
     if not companies:
         _log_diagnostic("company_candidates_extracted", candidate_count=0)

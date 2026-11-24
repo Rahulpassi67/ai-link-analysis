@@ -298,6 +298,8 @@ def test_valid_gemini_analysis_succeeds_without_failure_diagnostic(monkeypatch, 
     assert result["seo_analysis"]["metadata_assessment"]["meta_description"]["status"] == "missing"
     assert result["seo_analysis"]["seo_score"]["max_score"] == 100
     prompt = fake_models.request_contents[0]
+    assert "products, services, business types" in prompt
+    assert "Mark directly stated" in prompt and "as observed" in prompt
     for field in (
         "competitor_analysis", "target_search_queries", "seo_analysis",
         "primary_keywords", "branded_product_keywords", "keyword_intents",
@@ -343,6 +345,19 @@ def test_valid_response_with_phase_five_fields_is_preserved(monkeypatch):
         "keyword": "CRM software",
         "intent": "navigational",
     }]
+
+
+def test_invalid_query_relevance_is_repaired_without_retry_or_analysis_failure(monkeypatch):
+    analysis = _valid_analysis()
+    analysis["target_search_queries"][0]["relevance"] = "Relevant to this business."
+    fake_models = _mock_gemini(monkeypatch, json.dumps(analysis))
+
+    result = _run_analysis()
+
+    assert fake_models.calls == 1
+    assert result["target_search_queries"][0]["relevance"] == (
+        "The query mentions CRM, a topic listed in the business profile."
+    )
 
 
 def test_legacy_valid_response_defaults_missing_additive_fields(monkeypatch):

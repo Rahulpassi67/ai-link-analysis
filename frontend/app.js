@@ -7,6 +7,8 @@ const buttonText = document.getElementById("buttonText");
 const loadingPanel = document.getElementById("loadingPanel");
 const errorPanel = document.getElementById("errorPanel");
 const results = document.getElementById("results");
+const overviewView = document.getElementById("overview");
+const overviewResult = document.querySelector(".overview-result");
 const statusMessage = document.getElementById("statusMessage");
 const downloadBtn = document.getElementById("downloadBtn");
 
@@ -715,14 +717,36 @@ function renderReport(response) {
 
     latestReport = response;
 
-    results.classList.remove("hidden");
+    setDashboardView("overview");
     errorPanel.classList.add("hidden");
     statusMessage.textContent = "✓ Analysis completed successfully.";
 
-    results.scrollIntoView({
+    overviewView.scrollIntoView({
         behavior: "smooth",
         block: "start"
     });
+}
+
+function setDashboardView(viewId) {
+    const isOverview = viewId === "overview";
+    document.querySelectorAll("#results .content-section").forEach(section => {
+        section.classList.add("hidden");
+    });
+
+    if (isOverview) {
+        overviewView.classList.remove("hidden");
+        results.classList.toggle("hidden", !latestReport);
+        overviewResult.classList.remove("hidden");
+        return;
+    }
+
+    const selectedSection = document.getElementById(viewId);
+    if (!selectedSection || !results.contains(selectedSection)) return;
+
+    overviewView.classList.add("hidden");
+    overviewResult.classList.add("hidden");
+    results.classList.remove("hidden");
+    selectedSection.classList.remove("hidden");
 }
 
 form.addEventListener("submit", async event => {
@@ -862,12 +886,21 @@ downloadBtn.addEventListener("click", () => {
     URL.revokeObjectURL(downloadUrl);
 });
 
-// Update the active sidebar item while navigating.
+// Switch dashboard views and keep the sidebar in sync.
 document.querySelectorAll(".navigation .nav-link").forEach(link => {
-    link.addEventListener("click", () => {
+    link.addEventListener("click", event => {
+        const viewId = link.hash.slice(1);
+        const target = document.getElementById(viewId);
+        if (!target) return;
+
+        event.preventDefault();
+
         document.querySelectorAll(".navigation .nav-link")
             .forEach(item => item.classList.remove("active"));
-
         link.classList.add("active");
+        setDashboardView(viewId);
+
+        history.replaceState(null, "", link.hash);
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
     });
 });
