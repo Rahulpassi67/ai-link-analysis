@@ -533,6 +533,36 @@ def fallback_candidates_from_search_results(
     return candidates
 
 
+_NON_COMPANY_CANDIDATE_NAMES = {
+    "ecommerce platform",
+    "ecommerce platforms",
+    "e commerce platform",
+    "e commerce platforms",
+    "online platform",
+    "online platforms",
+    "software review",
+    "software reviews",
+    "review site",
+    "review sites",
+    "comparison site",
+    "comparison sites",
+    "company directory",
+    "business directory",
+}
+
+
+def is_publisher_candidate(company: dict) -> bool:
+    """Reject generic publisher/category labels mistaken for company names."""
+    name = normalize_company_name(str(company.get("name", "")))
+    if not name:
+        return True
+
+    # These phrases describe editorial or catalog content, not a distinct
+    # operating company or product. Keep the rule name-based and conservative
+    # so branded commerce vendors such as BigCommerce remain eligible.
+    return name in _NON_COMPANY_CANDIDATE_NAMES
+
+
 async def discover_official_websites(
     companies: list[dict],
     api_key: str
@@ -1219,6 +1249,19 @@ async def discover_competitors(
                 "message": "Gemini extraction was unavailable; Tavily candidates are being verified."
             }
 
+    input_company_count = len(companies)
+    companies = [
+        company for company in companies
+        if isinstance(company, dict) and not is_publisher_candidate(company)
+    ]
+    removed_publisher_count = input_company_count - len(companies)
+    if removed_publisher_count:
+        _log_diagnostic(
+            "publisher_candidates_filtered",
+            input_candidate_count=input_company_count,
+            removed_candidate_count=removed_publisher_count
+        )
+
     if not companies:
         _log_diagnostic("company_candidates_extracted", candidate_count=0)
         _log_discovery_summary(
@@ -1250,11 +1293,48 @@ async def discover_competitors(
     removed_by_validation = 0
 
     for company in companies:
-        validation = validate_company_evidence(
-            company,
-            unique_results,
-            profile=profile
-        )
+        company_name = str(company.get("name", "")).strip()
+        evidence_urls = company.get("evidence_urls", [])
+        if not isinstance(evidence_urls, list):
+            evidence_urls = []
+
+        # Gemini can omit a citation or return a URL variant that does not
+        # resolve to the corresponding Tavily result. Add only results whose
+        # title or snippet explicitly names this candidate; the normal
+        # relevance checks and fetched-page verification still apply.
+        if company_name:
+            cited_keys = {
+                canonicalize_url(str(url))
+                for url in evidence_urls
+                if canonicalize_url(str(url))
+            }
+            for result in unique_results:
+                result_url = str(result.get("url", ""))
+                result_key = canonicalize_url(result_url)
+                result_text = f"{result.get('title', '')} {result.get('content', '')}"
+                if (
+                    result_key
+                    and result_key not in cited_keys
+                    and company_name_matches_text(company_name, result_text)
+                ):
+                    evidence_urls.append(result_url)
+                    cited_keys.add(result_key)
+            company["evidence_urls"] = evidence_urls
+
+        try:
+            validation = validate_company_evidence(
+                company,
+                unique_results,
+                profile=profile
+            )
+        except Exception as error:
+            removed_by_validation += 1
+            _log_diagnostic(
+                "candidate_validation_failed", level="warning",
+                error_type=type(error).__name__,
+                candidate_name=company_name[:100]
+            )
+            continue
 
         if not validation:
             removed_by_validation += 1
