@@ -83,11 +83,13 @@ def _mock_gemini(monkeypatch, response_text, metadata=None):
         def __init__(self):
             self.calls = 0
             self.request_contents = []
+            self.request_configs = []
 
         def generate_content(self, **_kwargs):
             index = min(self.calls, len(responses) - 1)
             self.calls += 1
             self.request_contents.append(_kwargs.get("contents"))
+            self.request_configs.append(_kwargs.get("config"))
             return SimpleNamespace(text=responses[index], **(metadata or {}))
 
     fake_models = FakeModels()
@@ -250,6 +252,7 @@ def test_max_tokens_json_truncation_is_logged_and_not_retried(monkeypatch, caplo
     assert record.finish_reason == "MAX_TOKENS"
     assert record.json_parse_failed is True
     assert record.response_metadata["usage"]["candidates_token_count"] == 8192
+    assert fake_models.request_configs[0].max_output_tokens == llm_service.GEMINI_MAX_OUTPUT_TOKENS
     assert raised.value.code == "gemini_incomplete_output"
     assert "MAX_TOKENS" in caplog.text
     assert "competitor_analysis\":\"" not in caplog.text
@@ -293,7 +296,7 @@ def test_valid_gemini_analysis_succeeds_without_failure_diagnostic(monkeypatch, 
 
     assert result["competitor_analysis"]["brand_name"] == "Example CRM"
     assert len(result["target_search_queries"]) == 1
-    assert len(result["top_services"]) == 5
+    assert result["top_services"] == []
     assert result["seo_analysis"]["metadata_assessment"]["title_tag"]["observed"] == "Example"
     assert result["seo_analysis"]["metadata_assessment"]["meta_description"]["status"] == "missing"
     assert result["seo_analysis"]["seo_score"]["max_score"] == 100
@@ -438,6 +441,112 @@ def test_present_optional_seo_fields_still_reject_incorrect_types():
     analysis["seo_analysis"] = []
     with pytest.raises(ValueError, match="Invalid SEO analysis format"):
         llm_service.validate_analysis(analysis, website_data={"title": "Example"})
+
+
+def test_service_names_and_numerical_claims_need_offering_specific_source_text():
+    analysis = _valid_analysis()
+    analysis["competitor_analysis"]["products_services"] = ["Company OS", "Shopify POS"]
+    analysis["top_services"][0].update({
+        "name": "Shopify POS",
+        "description": "Point of sale tools for in-person payments.",
+        "target_industry": "Retail",
+        "target_customer": "retail businesses",
+        "business_benefit": "Sell in person 50% faster.",
+        "inferred": False,
+    })
+    for service in analysis["top_services"][1:]:
+        service["inferred"] = True
+    website = {
+        "title": "Shopify POS",
+        "content": (
+            "Example CRM supports teams. "
+            "Shopify POS provides point of sale tools for in-person payments for retail businesses."
+        )
+    }
+
+    result = llm_service.validate_analysis(analysis, website_data=website)
+
+    assert result["competitor_analysis"]["products_services"] == ["Shopify POS"]
+    service = result["top_services"][0]
+    assert service["description"] == "Point of sale tools for in-person payments."
+    assert service["target_customer"] == "retail businesses"
+    assert service["target_industry"] == "Retail"
+    assert service["business_benefit"] == "Not available"
+    assert len(result["top_services"]) == 1
+    assert result["top_services"][0]["name"] == "Shopify POS"
+
+
+def test_unsupported_service_suggestions_are_omitted_but_grounded_offerings_remain():
+    analysis = _valid_analysis()
+    analysis["top_services"][0].update({
+        "name": "Shop Pay",
+        "description": "Checkout tools for online stores.",
+        "business_benefit": "Faster checkout.",
+        "inferred": False,
+    })
+    analysis["top_services"][1].update({
+        "name": "AI Growth Engine",
+        "description": "An AI service that doubles conversions.",
+        "inferred": True,
+    })
+    for service in analysis["top_services"][2:]:
+        service["inferred"] = True
+    website = {
+        "title": "Shopify",
+        "content": (
+            "Example CRM software helps teams. "
+            "Shop Pay provides checkout tools for online stores. "
+            "Merchants use Shop Pay to complete purchases."
+        ),
+    }
+
+    result = llm_service.validate_analysis(analysis, website_data=website)
+
+    assert [service["name"] for service in result["top_services"]] == ["Shop Pay"]
+    assert result["top_services"][0]["description"] == "Checkout tools for online stores."
+
+
+def test_full_validation_preserves_shopify_audience_range_without_endpoint_profiles():
+    analysis = _valid_analysis()
+    quote = "For anyone from entrepreneurs to enterprise."
+    independent_quote = "Shopify supports online merchants."
+    audience = analysis["target_audience"]
+    audience.update({
+        "primary_audience": "Not available",
+        "business_types": ["Enterprise"],
+        "customer_profiles": ["Enterprise"],
+        "recommended_marketing_segments": ["Enterprise"],
+        "audience_evidence": [
+            {
+                "field": "primary_audience",
+                "claim": "online merchants",
+                "basis": "observed",
+                "supporting_text": independent_quote,
+                "reason": "",
+            },
+            *[{
+                "field": field,
+                "claim": "Enterprise",
+                "basis": "observed",
+                "supporting_text": quote,
+                "reason": "",
+            }
+            for field in (
+                "business_types", "customer_profiles", "recommended_marketing_segments",
+            )],
+        ],
+    })
+    website = {
+        "title": "Example CRM",
+        "content": f"Example CRM software helps teams. {independent_quote} {quote}",
+    }
+
+    result = llm_service.validate_analysis(analysis, website_data=website)
+
+    assert result["target_audience"]["primary_audience"] == "entrepreneurs to enterprise"
+    assert result["target_audience"]["business_types"] == []
+    assert result["target_audience"]["customer_profiles"] == []
+    assert result["target_audience"]["recommended_marketing_segments"] == []
 
 
 def test_gemini_validation_error_keeps_structured_api_response(monkeypatch):

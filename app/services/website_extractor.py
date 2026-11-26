@@ -83,10 +83,54 @@ def extract_html(html: str, page_url: str, method: str):
     soup = BeautifulSoup(html, "html.parser")
 
     for element in soup([
-        "script", "style", "noscript", "iframe",
-        "svg", "canvas", "template"
+        "script", "style", "noscript", "iframe", "svg", "canvas",
+        "template", "nav", "menu", "dialog", "aside", "form",
     ]):
         element.decompose()
+
+    # Site-level headers/footers are usually outside the page's semantic
+    # content. Keep article/main headers and footers, which can carry useful
+    # product descriptions or article summaries.
+    for element in list(soup.find_all(["header", "footer"])):
+        if not element.find_parent(["main", "article"]):
+            element.decompose()
+
+    # Remove common interactive/utility regions that are often placed outside
+    # semantic nav/footer elements (cookie notices, drawers, menus, etc.).
+    ui_patterns = {
+        "cookie-banner", "cookie-consent", "cookie-consent-banner",
+        "consent-banner", "consent-dialog",
+        "site-navigation", "main-navigation", "primary-navigation",
+        "mobile-navigation", "navbar", "breadcrumb", "menu-toggle",
+        "mobile-menu", "modal", "popup", "overlay", "drawer",
+        "social-links", "share-tools", "utility-nav", "toolbar",
+        "sidebar", "site-header", "site-footer", "skip-link",
+        "newsletter-signup", "promo-banner", "announcement-bar",
+    }
+    for element in list(soup.find_all(True)):
+        if element.attrs is None:
+            continue
+        identifiers = {str(element.get("id", "")).strip().lower()}
+        identifiers.update(str(value).strip().lower() for value in element.get("class", []))
+        role = str(element.get("role", "")).strip().lower()
+        aria_label = str(element.get("aria-label", "")).strip().lower()
+        hidden = (
+            element.has_attr("hidden")
+            or str(element.get("aria-hidden", "")).strip().lower() == "true"
+            or str(element.get("type", "")).strip().lower() == "hidden"
+        )
+        if (
+            hidden
+            or identifiers & ui_patterns
+            or any(
+                pattern in identifier
+                for identifier in identifiers
+                for pattern in ("cookie-consent", "cookie-banner", "navigation", "breadcrumb", "sidebar")
+            )
+            or role in {"navigation", "menu", "dialog", "complementary"}
+            or aria_label in {"cookie consent", "cookie preferences", "site navigation", "main navigation"}
+        ):
+            element.decompose()
 
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
 
@@ -103,15 +147,56 @@ def extract_html(html: str, page_url: str, method: str):
 
     description = meta.get("content", "").strip() if meta else ""
 
-    headings = [
-        heading.get_text(" ", strip=True)
-        for heading in soup.find_all(["h1", "h2", "h3"])
+    semantic_roots = soup.find_all(["main", "article"])
+    # Keep sibling articles/cards as well as the main container, without
+    # separately adding nested articles already covered by another root.
+    content_roots = [
+        node for node in semantic_roots
+        if not node.find_parent(["main", "article"])
     ]
+    content_roots.extend(
+        node for node in soup.find_all("section")
+        if not node.find_parent(["main", "article", "section"])
+        and not node.find(["main", "article"])
+    )
+    if not content_roots:
+        # Preserve all remaining body content when semantic containers are
+        # absent; UI removal above provides the safe fallback.
+        content_roots = [soup.body or soup]
 
-    main_content = soup.find("main") or soup.find("article") or soup.body or soup
+    content_parts = []
+    headings = []
+    text_block_tags = {"h1", "h2", "h3", "p", "li", "blockquote", "figcaption"}
+    for root in content_roots:
+        text_blocks = root.find_all(list(text_block_tags))
+        top_level_blocks = [
+            block for block in text_blocks
+            if not any(parent.name in text_block_tags for parent in block.parents if parent is not root)
+        ]
+        if top_level_blocks:
+            content_parts.extend(
+                block.get_text(separator=" ", strip=True)
+                for block in top_level_blocks
+            )
+        else:
+            content_parts.append(root.get_text(separator=" ", strip=True))
+        headings.extend(
+            heading.get_text(" ", strip=True)
+            for heading in root.find_all(["h1", "h2", "h3"])
+        )
 
-    content = main_content.get_text(separator=" ", strip=True)
-    content = " ".join(content.split())
+    # Preserve paragraph/sentence boundaries for downstream evidence checks
+    # and remove repeated UI snippets without reordering the page text.
+    content_lines = []
+    seen_lines = set()
+    for part in content_parts:
+        for line in part.splitlines():
+            cleaned = " ".join(line.split())
+            normalized = cleaned.casefold()
+            if cleaned and normalized not in seen_lines:
+                content_lines.append(cleaned)
+                seen_lines.add(normalized)
+    content = "\n".join(content_lines)
 
     return {
         "url": page_url,

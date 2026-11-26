@@ -153,6 +153,53 @@ def test_incomplete_analysis_response_is_rejected(monkeypatch):
 
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "invalid_analysis_response"
+    assert "analysis" not in response.json()
+
+
+def test_target_website_http_403_is_reported_without_analysis(monkeypatch):
+    from app.utils.errors import WebsiteExtractionError
+
+    async def forbidden(url):
+        raise WebsiteExtractionError(
+            "website_http_error",
+            "The target website returned HTTP 403.",
+            502,
+        )
+
+    monkeypatch.setattr(main, "extract_website_content", forbidden)
+    response = client.post("/link-analysis", json={"url": "https://example.com"})
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "website_http_error"
+    assert response.json()["detail"] == "The target website returned HTTP 403."
+    assert "analysis" not in response.json()
+
+
+def test_gemini_timeout_is_reported_without_analysis(monkeypatch):
+    from app.utils.errors import ExternalServiceError
+
+    async def mock_extract(url):
+        return {
+            "url": url,
+            "title": "Example",
+            "meta_description": "",
+            "content": "Example business content. " * 20,
+        }
+
+    async def timeout(_website_data):
+        raise ExternalServiceError(
+            "gemini_timeout",
+            "Gemini did not respond before the request timed out.",
+            504,
+        )
+
+    monkeypatch.setattr(main, "extract_website_content", mock_extract)
+    monkeypatch.setattr(main, "analyze_with_ai", timeout)
+    response = client.post("/link-analysis", json={"url": "https://example.com"})
+
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "gemini_timeout"
+    assert "analysis" not in response.json()
 
 
 def test_unreachable_site_and_timeout_use_structured_errors(monkeypatch):
@@ -193,7 +240,7 @@ def test_gemini_quota_error_is_reported_safely(monkeypatch):
     async def rate_limited(website_data):
         raise ExternalServiceError(
             "gemini_rate_limited",
-            "Gemini is temporarily rate limited. Please try again later.",
+            "Gemini is temporarily rate limited. Please wait before trying again.",
             503
         )
 
@@ -203,6 +250,7 @@ def test_gemini_quota_error_is_reported_safely(monkeypatch):
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "gemini_rate_limited"
+    assert "wait before trying again" in response.json()["error"]["message"]
     assert "API key" not in response.text
 
 

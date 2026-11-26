@@ -5,6 +5,7 @@ from app.services.competitor_discovery import (
     classify_competitor_type_from_sources,
     deduplicate_companies,
     find_official_website,
+    is_publisher_candidate,
     official_website_is_validated,
     rank_candidates_by_evidence,
     validate_company_evidence,
@@ -267,7 +268,7 @@ def test_evidence_tier_ranks_above_semantic_similarity_and_drops_irrelevant_page
     ])
 
     assert [candidate["name"] for candidate in ranked] == [
-        "Direct Evidence", "Explicit Comparison", "Semantic Match"
+        "Direct Evidence", "Explicit Comparison"
     ]
 
 
@@ -283,9 +284,39 @@ def test_weak_candidate_remains_unclear_and_is_not_marked_strong():
         "evidence_details": _fetched_evidence_detail("Weak Candidate"),
     }])
 
-    assert len(ranked) == 1
-    assert ranked[0]["competitor_type"] == "unclear"
-    assert ranked[0]["evidence_strength"] == "weak"
+    assert ranked == []
+
+
+def test_generic_candidate_names_need_a_specific_product_to_be_considered():
+    assert is_publisher_candidate({"name": "What"})
+    assert is_publisher_candidate({"name": "market"})
+    assert is_publisher_candidate({"name": "EIN Presswire"})
+    assert is_publisher_candidate({"name": "EINPresswire"})
+    assert is_publisher_candidate({"name": "EINPresswire.com"})
+    assert not is_publisher_candidate({"name": "What", "product_name": "What CRM"})
+
+
+def test_einpresswire_market_overlap_candidate_is_excluded_from_results():
+    candidate = {
+        "name": "EINPresswire",
+        "product_name": "Press release distribution",
+        "evidence_status": "market_overlap_unverified",
+        "evidence_pages_accessible": 1,
+        "heuristic_evidence_score": 0.8,
+        "similarity_score": 0.99,
+        "evidence_details": _fetched_evidence_detail(
+            "EINPresswire", "market_overlap_unverified"
+        ),
+    }
+
+    assert is_publisher_candidate(candidate)
+    assert rank_candidates_by_evidence([candidate]) == []
+
+
+def test_known_press_and_comparison_domains_are_excluded_as_candidate_sources():
+    assert discovery.is_excluded_domain("www.einpresswire.com")
+    assert discovery.is_excluded_domain("press.prnewswire.com")
+    assert discovery.is_excluded_domain("www.trustradius.com")
 
 
 def test_negated_competitor_wording_does_not_classify_direct():

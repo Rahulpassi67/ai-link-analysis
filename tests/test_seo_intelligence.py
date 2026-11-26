@@ -7,6 +7,7 @@ from app.services.llm_service import (
     filter_supported_industry_segments,
     ground_audience_claims,
     validate_search_queries,
+    validate_service_audience_claims,
     validate_seo_analysis,
 )
 
@@ -233,9 +234,39 @@ def test_industry_segments_directly_named_on_page_need_no_model_evidence_object(
     assert evidence == [{
         "industry": "Retail",
         "basis": "observed",
-        "supporting_text": "retail",
+        "supporting_text": "Shopify supports retail businesses selling online.",
         "reason": "",
     }]
+
+
+def test_industry_filter_rejects_departments_and_retains_real_industries():
+    quote = "The Company OS serves engineering, sales, customer support and finance teams in healthcare organizations."
+    labels = ("Engineering", "Sales", "Customer Support", "Finance", "Healthcare")
+    industries, evidence = filter_supported_industry_segments(
+        list(labels),
+        [{
+            "industry": label,
+            "basis": "inferred",
+            "supporting_text": quote,
+            "reason": "The page identifies this market.",
+        } for label in labels],
+        {"content": quote},
+    )
+
+    assert industries == ["Healthcare"]
+    assert [item["industry"] for item in evidence] == ["Healthcare"]
+
+
+def test_industry_filter_does_not_restore_word_only_labels():
+    quote = "The Company OS brings engineering, sales, customer support and finance teams together."
+    industries, evidence = filter_supported_industry_segments(
+        ["Engineering", "Sales", "Customer Support", "Finance"],
+        [],
+        {"content": quote},
+    )
+
+    assert industries == []
+    assert evidence == []
 
 
 def test_validated_audience_evidence_populates_empty_fields():
@@ -266,8 +297,8 @@ def test_validated_audience_evidence_populates_empty_fields():
                 "field": "secondary_audience",
                 "claim": "enterprise brands",
                 "basis": "inferred",
-                "supporting_text": "enterprise brands",
-                "reason": "The page identifies enterprise brands as an audience segment.",
+                "supporting_text": "Shopify supports retailers and enterprise brands.",
+                "reason": "The page explicitly connects the product to enterprise brands.",
             },
             {
                 "field": "needs_and_challenges",
@@ -287,6 +318,48 @@ def test_validated_audience_evidence_populates_empty_fields():
     assert [item["basis"] for item in result["audience_evidence"]] == [
         "observed", "inferred", "observed"
     ]
+
+
+def test_audience_range_is_preserved_without_creating_endpoint_profile():
+    quote = "For anyone from entrepreneurs to enterprise."
+    audience = {
+        "primary_audience": "Enterprise",
+        "secondary_audience": "Not available",
+        "business_types": ["Enterprise"],
+        "customer_profiles": ["Enterprise"],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": ["Enterprise"],
+        "audience_evidence": [
+            {
+                "field": "primary_audience", "claim": "Enterprise",
+                "basis": "observed", "supporting_text": quote, "reason": "",
+            },
+            {
+                "field": "customer_profiles", "claim": "Enterprise",
+                "basis": "observed", "supporting_text": quote, "reason": "",
+            },
+            {
+                "field": "business_types", "claim": "Enterprise",
+                "basis": "observed", "supporting_text": quote, "reason": "",
+            },
+            {
+                "field": "recommended_marketing_segments", "claim": "Enterprise",
+                "basis": "observed", "supporting_text": quote, "reason": "",
+            },
+        ],
+    }
+
+    result = ground_audience_claims(audience, {"content": quote})
+
+    assert result["primary_audience"] == "entrepreneurs to enterprise"
+    assert result["secondary_audience"] == "Not available"
+    assert result["business_types"] == []
+    assert result["customer_profiles"] == []
+    assert result["recommended_marketing_segments"] == []
+    assert len(result["audience_evidence"]) == 1
+    assert result["audience_evidence"][0]["field"] == "primary_audience"
 
 
 def test_inferred_audience_claim_needs_shared_terms_with_its_source_quote():
@@ -325,6 +398,231 @@ def test_inferred_audience_claim_needs_shared_terms_with_its_source_quote():
     assert result["primary_audience"] == "small marketing teams"
     assert result["secondary_audience"] == "Not available"
     assert [item["basis"] for item in result["audience_evidence"]] == ["inferred"]
+
+
+def test_audience_claim_must_be_connected_to_relation_not_nearby_by_chance():
+    website = {
+        "content": (
+            "Acme offers tools for small teams. Enterprise finance departments "
+            "are mentioned elsewhere in the page."
+        )
+    }
+    audience = {
+        "primary_audience": "Not available",
+        "secondary_audience": "Not available",
+        "business_types": [],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [{
+            "field": "primary_audience",
+            "claim": "enterprise finance departments",
+            "basis": "observed",
+            "supporting_text": "Acme offers tools for small teams. Enterprise finance departments are mentioned elsewhere in the page.",
+            "reason": "",
+        }],
+    }
+
+    result = ground_audience_claims(audience, website)
+
+    assert result["primary_audience"] == "Not available"
+    assert result["audience_evidence"] == []
+
+
+def test_natural_language_audience_description_is_accepted():
+    quote = "Independent retailers make up most of our customer base."
+    audience = {
+        "primary_audience": "independent retailers",
+        "secondary_audience": "Not available",
+        "business_types": [],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [],
+    }
+
+    result = ground_audience_claims(audience, {"content": quote})
+
+    assert result["primary_audience"] == "independent retailers"
+    assert result["audience_evidence"][0]["supporting_text"] == quote
+
+
+def test_short_audience_quotes_are_expanded_to_one_exact_source_sentence():
+    source_sentence = "Acme serves independent retailers and small agencies."
+    audience = {
+        "primary_audience": "Not available",
+        "secondary_audience": "Not available",
+        "business_types": [],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [
+            {
+                "field": "primary_audience",
+                "claim": "independent retailers",
+                "basis": "observed",
+                "supporting_text": "independent retailers",
+                "reason": "",
+            },
+            {
+                "field": "business_types",
+                "claim": "small agencies",
+                "basis": "inferred",
+                "supporting_text": "small agencies",
+                "reason": "The page explicitly identifies these businesses as customers.",
+            },
+        ],
+    }
+
+    result = ground_audience_claims(audience, {"content": source_sentence})
+
+    assert result["primary_audience"] == "independent retailers"
+    assert result["business_types"] == ["small agencies"]
+    assert [item["basis"] for item in result["audience_evidence"]] == ["observed", "inferred"]
+    assert all(item["supporting_text"] == source_sentence for item in result["audience_evidence"])
+
+
+def test_concatenated_multisentence_audience_evidence_is_replaced_with_clean_source_text():
+    source_sentence = "Acme serves independent retailers and small agencies."
+    audience = {
+        "primary_audience": "independent retailers",
+        "secondary_audience": "Not available",
+        "business_types": [],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [{
+            "field": "primary_audience",
+            "claim": "independent retailers",
+            "basis": "observed",
+            "supporting_text": (
+                "Home Pricing Careers. " + source_sentence + " Privacy Contact."
+            ),
+            "reason": "",
+        }],
+    }
+
+    result = ground_audience_claims(audience, {"content": source_sentence})
+
+    assert result["primary_audience"] == "independent retailers"
+    assert len(result["audience_evidence"]) == 1
+    assert result["audience_evidence"][0]["supporting_text"] == source_sentence
+    assert "Home Pricing" not in result["audience_evidence"][0]["supporting_text"]
+
+
+def test_audience_claims_remain_unavailable_without_reliable_source_evidence():
+    audience = {
+        "primary_audience": "Retail teams",
+        "secondary_audience": "Enterprise buyers",
+        "business_types": ["Retail businesses"],
+        "customer_profiles": ["Retail managers"],
+        "geographic_focus": ["North America"],
+        "needs_and_challenges": ["Reduce operating costs"],
+        "interests": ["Automation"],
+        "recommended_marketing_segments": ["Enterprise retailers"],
+        "audience_evidence": [{
+            "field": "primary_audience",
+            "claim": "Retail teams",
+            "basis": "inferred",
+            "supporting_text": "Retail teams use our service.",
+            "reason": "The model inferred this audience.",
+        }],
+    }
+    website = {"title": "", "meta_description": "", "content": ""}
+
+    result = ground_audience_claims(audience, website)
+    industries, industry_evidence = filter_supported_industry_segments(
+        ["Retail"],
+        [{
+            "industry": "Retail",
+            "basis": "inferred",
+            "supporting_text": "Retail is a relevant industry.",
+            "reason": "The model inferred this industry.",
+        }],
+        website,
+    )
+
+    assert result["primary_audience"] == "Not available"
+    assert result["secondary_audience"] == "Not available"
+    for field in (
+        "business_types", "customer_profiles", "geographic_focus",
+        "needs_and_challenges", "interests", "recommended_marketing_segments",
+    ):
+        assert result[field] == []
+    assert result["audience_evidence"] == []
+    assert industries == []
+    assert industry_evidence == []
+
+
+def test_service_audience_claims_require_service_specific_source_text():
+    services = [{
+        "name": "Project Hub",
+        "description": "Project planning software",
+        "target_customer": "Finance teams",
+        "target_industry": "Healthcare",
+        "business_benefit": "Manage workflows",
+        "inferred": False,
+    }]
+    website = {
+        "content": (
+            "Project Hub helps project managers organize work. "
+            "The Company OS also discusses finance teams and healthcare trends."
+        )
+    }
+
+    result = validate_service_audience_claims(services, website)
+
+    assert result[0]["target_customer"] == "Not available"
+    assert result[0]["target_industry"] == "Not available"
+
+
+def test_service_claim_words_cannot_supply_their_own_context_overlap():
+    services = [{
+        "name": "Shopify Plus",
+        "description": "Enterprise commerce platform",
+        "target_customer": "Enterprise",
+        "target_industry": "Enterprise",
+        "business_benefit": "Scale operations",
+        "inferred": False,
+    }]
+    website = {"content": "For anyone from entrepreneurs to enterprise."}
+
+    result = validate_service_audience_claims(services, website)
+
+    assert result[0]["target_customer"] == "Not available"
+    assert result[0]["target_industry"] == "Not available"
+
+
+def test_service_fields_keep_offering_specific_evidence_and_drop_unsupported_numbers():
+    services = [{
+        "name": "Shopify POS",
+        "description": "Point of sale tools for in-person payments.",
+        "target_customer": "retail businesses",
+        "target_industry": "Retail",
+        "business_benefit": "Sell in person 50% faster.",
+        "inferred": False,
+    }]
+    website = {
+        "content": (
+            "Shopify POS provides point of sale tools for in-person payments for retail businesses."
+        )
+    }
+
+    result = validate_service_audience_claims(services, website)
+
+    assert result[0]["name"] == "Shopify POS"
+    assert result[0]["description"] == "Point of sale tools for in-person payments."
+    assert result[0]["target_customer"] == "retail businesses"
+    assert result[0]["target_industry"] == "Retail"
+    assert result[0]["business_benefit"] == "Not available"
 
 
 def test_service_customer_and_industry_evidence_populates_audience_fields():
@@ -436,6 +734,65 @@ def test_repeated_audience_evidence_is_merged_without_losing_fields_or_provenanc
     )
     assert observed["supporting_text"] == quote
     assert any(item["basis"] == "inferred" for item in result["audience_evidence"])
+
+
+def test_distinct_audience_quotes_are_preserved_while_exact_duplicates_merge():
+    website = {
+        "content": (
+            "Acme supports retail teams. Acme also helps enterprise teams."
+        )
+    }
+    audience = {
+        "primary_audience": "retail teams",
+        "secondary_audience": "enterprise teams",
+        "business_types": [],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": [],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [
+            {
+                "field": "primary_audience", "claim": "retail teams",
+                "basis": "observed", "supporting_text": "Acme supports retail teams", "reason": "",
+            },
+            {
+                "field": "customer_profiles", "claim": "retail teams",
+                "basis": "observed", "supporting_text": "Acme supports retail teams", "reason": "",
+            },
+            {
+                "field": "secondary_audience", "claim": "enterprise teams",
+                "basis": "observed", "supporting_text": "Acme also helps enterprise teams", "reason": "",
+            },
+        ],
+    }
+
+    result = ground_audience_claims(audience, website)
+
+    assert len(result["audience_evidence"]) == 2
+    assert {item["supporting_text"] for item in result["audience_evidence"]} == {
+        "Acme supports retail teams.", "Acme also helps enterprise teams."
+    }
+
+
+def test_unsupported_customer_needs_are_removed_without_inference():
+    website = {"content": "Acme provides CRM software for sales teams."}
+    audience = {
+        "primary_audience": "sales teams",
+        "secondary_audience": "Not available",
+        "business_types": [],
+        "customer_profiles": [],
+        "geographic_focus": [],
+        "needs_and_challenges": ["reduce tax liability"],
+        "interests": [],
+        "recommended_marketing_segments": [],
+        "audience_evidence": [],
+    }
+
+    result = ground_audience_claims(audience, website)
+
+    assert result["needs_and_challenges"] == []
+    assert not any(item["field"] == "needs_and_challenges" for item in result["audience_evidence"])
 
 
 def test_industry_evidence_populates_empty_segment_field():

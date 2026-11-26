@@ -88,8 +88,8 @@ def test_market_overlap_alone_remains_unclear_and_below_comparison_strength():
         analyzed_brand_name="Linkly AI"
     )
 
-    assert result["evidence_status"] == "company_and_product_mentioned"
-    assert result["evidence_strength"] == "partial"
+    assert result["evidence_status"] == "market_overlap_unverified"
+    assert result["evidence_strength"] == "weak"
     assert result["evidence_status"] != "explicit_competitor_relationship_found"
 
 
@@ -171,7 +171,7 @@ def test_own_company_and_product_mentions_do_not_verify_relationship():
         analyzed_brand_name="Linkly AI"
     )
 
-    assert result["evidence_status"] == "company_and_product_mentioned"
+    assert result["evidence_status"] == "market_overlap_unverified"
     assert result["evidence_status"] != "explicit_competitor_relationship_found"
     assert result["evidence_details"][0]["excerpts"]
     assert all(
@@ -393,11 +393,28 @@ def test_relevant_market_context_without_competitor_wording_can_qualify_unclear(
     )
 
     candidate = _rankable_candidate("Adobe", "Adobe Commerce", result)
-    assert result["evidence_status"] == "company_and_product_mentioned"
-    assert rank_candidates_by_evidence([candidate]) == [candidate]
+    assert result["evidence_status"] == "market_overlap_unverified"
+    assert rank_candidates_by_evidence([candidate]) == []
     assert classify_competitor_type_from_sources(
         "Adobe", "Adobe Commerce", "Shopify", [{"url": source_url, "content": statement}]
     )[0] == "unclear"
+
+
+def test_company_mention_in_relevant_article_without_a_product_does_not_qualify():
+    result = evaluate_evidence(
+        {"name": "What", "product_name": ""},
+        [{
+            "url": "https://editorial.example/shopify-market",
+            "accessible": True,
+            "text": "What was mentioned in a Shopify ecommerce platform market report.",
+        }],
+        analyzed_brand_name="Shopify",
+        relevance_anchors=["e-commerce platform"],
+    )
+
+    candidate = _rankable_candidate("What", "", result)
+    assert result["evidence_status"] == "company_mentioned"
+    assert rank_candidates_by_evidence([candidate]) == []
 
 
 def test_standalone_company_and_generic_product_mentions_are_filtered():

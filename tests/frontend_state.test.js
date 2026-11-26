@@ -53,6 +53,13 @@ function makeHarness(fetchImpl) {
             if (!elements.has(id)) elements.set(id, new FakeElement(id));
             return elements.get(id);
         },
+        querySelector(selector) {
+            if (selector === ".overview-result") {
+                if (!elements.has(selector)) elements.set(selector, new FakeElement(selector));
+                return elements.get(selector);
+            }
+            return null;
+        },
         createElement(tag) { return new FakeElement(tag); },
         querySelectorAll() { return []; },
         body: new FakeElement("body"),
@@ -280,6 +287,24 @@ test("HTTP errors are reported with status instead of as network failures", asyn
 
     assert.match(elements.get("errorPanel").textContent, /HTTP 502/);
     assert.doesNotMatch(elements.get("errorPanel").textContent, /Could not connect/i);
+});
+
+test("Gemini rate limits show a clear wait-and-retry message", async () => {
+    const body = JSON.stringify({
+        success: false,
+        error: {
+            code: "gemini_rate_limited",
+            message: "Gemini is temporarily rate limited. Please wait before trying again.",
+        },
+        detail: "Gemini is temporarily rate limited. Please wait before trying again.",
+    });
+    const { elements } = makeHarness(async () => responseWith(503, body));
+    elements.get("websiteUrl").value = "https://shopify.com/";
+
+    await submit(elements.get("analysisForm"));
+
+    assert.match(elements.get("errorPanel").textContent, /HTTP 503/);
+    assert.match(elements.get("errorPanel").textContent, /temporarily rate limited.*wait before trying again/i);
 });
 
 test("invalid JSON from a successful HTTP response has a distinct error", async () => {

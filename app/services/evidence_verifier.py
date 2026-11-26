@@ -643,7 +643,7 @@ def evaluate_evidence(
         "test",
         "sample",
         "demo",
-        "company"
+        "company",
     }
 
     if company_name.lower() in generic_test_names:
@@ -915,7 +915,7 @@ def evaluate_evidence(
             page_classification = "explicit_competitor_relationship_found"
         elif comparison_signal:
             page_classification = "product_or_capability_comparison_found"
-        elif company_mentioned and product_mentioned and excerpts:
+        elif company_mentioned and product_mentioned and product_name_is_specific and excerpts:
             page_classification = "company_and_product_mentioned"
         elif company_mentioned and excerpts:
             page_classification = "company_mentioned"
@@ -1011,8 +1011,8 @@ def evaluate_evidence(
         strength = "moderate"
 
     elif company_support and product_support:
-        status = "company_and_product_mentioned"
-        strength = "partial"
+        status = "market_overlap_unverified"
+        strength = "weak"
 
     elif company_support:
         status = "company_mentioned"
@@ -1100,6 +1100,12 @@ def classify_evidence(evidence_status: str) -> dict:
             "evidence_confidence": 0.60,
             "evidence_classification": "company_and_product_mentioned",
             "evidence_strength": "partial"
+        },
+
+        "market_overlap_unverified": {
+            "evidence_confidence": 0.35,
+            "evidence_classification": "market_overlap_unverified",
+            "evidence_strength": "weak"
         },
 
         "company_mentioned": {

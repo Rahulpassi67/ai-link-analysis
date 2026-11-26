@@ -6,6 +6,96 @@ from app.services import website_extractor
 from app.utils.errors import WebsiteExtractionError
 
 
+def test_html_extraction_excludes_navigation_footer_and_cookie_ui():
+    html = """
+    <html><head><title>Acme CRM</title></head><body>
+      <header><a>Home</a><a>Pricing</a></header>
+      <nav><a>Unrelated Product</a></nav>
+      <div class="cookie-banner">Accept all cookies</div>
+      <main><h1>Acme CRM</h1><p>CRM tools help sales teams manage leads.</p></main>
+      <footer>Privacy policy Contact us</footer>
+    </body></html>
+    """
+
+    result = website_extractor.extract_html(html, "https://public.example/", "test")
+
+    assert "Acme CRM" in result["content"]
+    assert "sales teams" in result["content"]
+    assert "Pricing" not in result["content"]
+    assert "Unrelated Product" not in result["content"]
+    assert "Accept all cookies" not in result["content"]
+    assert "Privacy policy" not in result["content"]
+
+
+def test_html_extraction_falls_back_to_text_rich_section():
+    html = """
+    <html><body><nav>Menu item</nav>
+      <section><h2>Services</h2><p>We provide useful consulting services.</p></section>
+      <footer>Legal links</footer>
+    </body></html>
+    """
+
+    result = website_extractor.extract_html(html, "https://public.example/", "test")
+
+    assert "useful consulting services" in result["content"]
+    assert "Menu item" not in result["content"]
+    assert "Legal links" not in result["content"]
+
+
+def test_html_extraction_keeps_legitimate_cookie_and_social_product_content():
+    html = """
+    <html><body>
+      <main><h1>Cookie Manager</h1><p>Manage cookie settings for visitors.</p>
+        <section class="social-media-marketing">
+          <h2>Social media marketing</h2><p>Plan campaigns across social channels.</p>
+        </section>
+      </main>
+      <div class="cookie-consent-banner">Accept cookies</div>
+      <div id="main-navigation"><a>Unrelated product</a></div>
+    </body></html>
+    """
+
+    result = website_extractor.extract_html(html, "https://public.example/", "test")
+
+    assert "Manage cookie settings" in result["content"]
+    assert "Plan campaigns" in result["content"]
+    assert "Accept cookies" not in result["content"]
+    assert "Unrelated product" not in result["content"]
+
+
+def test_html_extraction_keeps_sibling_article_and_section_content():
+    html = """
+    <html><body>
+      <main><h1>Product overview</h1><p>Manage inventory.</p></main>
+      <article><h2>Shipping tools</h2><p>Compare shipping rates.</p></article>
+      <section><h2>Payments</h2><p>Accept online payments.</p></section>
+      <footer>Legal links</footer>
+    </body></html>
+    """
+
+    result = website_extractor.extract_html(html, "https://public.example/", "test")
+
+    assert "Manage inventory" in result["content"]
+    assert "Compare shipping rates" in result["content"]
+    assert "Accept online payments" in result["content"]
+    assert "Legal links" not in result["content"]
+
+
+def test_html_body_fallback_drops_hidden_sidebar_and_navigation_text():
+    html = """
+    <html><body>
+      <div role="navigation">Home Pricing Careers</div>
+      <div hidden>Hidden audience claim</div>
+      <aside class="sidebar">Related stories and partner logos</aside>
+      <div>Acme serves independent retailers and small agencies.</div>
+    </body></html>
+    """
+
+    result = website_extractor.extract_html(html, "https://public.example/", "test")
+
+    assert result["content"] == "Acme serves independent retailers and small agencies."
+
+
 class FakeResponse:
     def __init__(self, status_code=200, body=b"<html><body><p>Useful site content</p></body></html>"):
         self.status_code = status_code

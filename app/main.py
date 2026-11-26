@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError
 
 from app.services.website_extractor import extract_website_content
-from app.services.llm_service import analyze_with_ai
+from app.services.llm_service import analyze_with_ai, reset_analysis_id, set_analysis_id
 from app.services.competitor_discovery import discover_competitors
 from app.utils.errors import ServiceError, WebsiteContentError
 
@@ -142,6 +143,7 @@ def health_check() -> HealthResponse:
 
 @app.post("/link-analysis", response_model=LinkAnalysisResponse)
 async def link_analysis(request: LinkRequest):
+    analysis_token = set_analysis_id(uuid.uuid4().hex)
     try:
         async with _analysis_semaphore, asyncio.timeout(ANALYSIS_TIMEOUT_SECONDS):
             # Step 1: Extract and validate website content.
@@ -287,6 +289,8 @@ async def link_analysis(request: LinkRequest):
             "Website analysis could not complete. Please try again.",
             502
         ) from error
+    finally:
+        reset_analysis_id(analysis_token)
 
 
 # Serve the frontend from the project-level frontend directory

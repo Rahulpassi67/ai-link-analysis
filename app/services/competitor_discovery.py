@@ -5,8 +5,12 @@ from app.services.evidence_verifier import (
 )
 import asyncio
 import json
+import hashlib
 import logging
 import re
+import threading
+import time
+from collections import OrderedDict
 from urllib.parse import urlparse
 
 from tavily import TavilyClient
@@ -17,6 +21,11 @@ from app.services.llm_service import (
     client as gemini_client,
     GEMINI_MODEL,
     gemini_cooldown_remaining,
+    current_analysis_id,
+    generate_gemini_content,
+    _gemini_rate_limit_error,
+    _safe_gemini_exception_details,
+    _retry_delay,
 )
 from app.utils.company_names import (
     company_name_matches_text,
@@ -29,6 +38,42 @@ logger.setLevel(logging.INFO)
 
 TAVILY_REQUEST_TIMEOUT = 12
 GEMINI_DISCOVERY_TIMEOUT = 20
+COMPETITOR_CACHE_TTL_SECONDS = 300
+COMPETITOR_CACHE_MAX_ENTRIES = 128
+_COMPETITOR_CACHE_LOCK = threading.Lock()
+_COMPETITOR_EXTRACTION_CACHE: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+
+
+def _normalized_cache_value(value):
+    if isinstance(value, dict):
+        return {
+            str(key).strip().lower(): _normalized_cache_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]).lower())
+        }
+    if isinstance(value, list):
+        return [_normalized_cache_value(item) for item in value]
+    if isinstance(value, str):
+        return " ".join(value.split()).casefold()
+    return value
+
+
+def _competitor_cache_key(website_url: str, profile: dict, search_results: list[dict]) -> str:
+    normalized_results = [
+        {
+            "url": canonicalize_url(str(item.get("url", ""))),
+            "title": _normalized_cache_value(str(item.get("title", "") or "")),
+            "content": _normalized_cache_value(str(item.get("content", "") or "")),
+        }
+        for item in search_results
+    ]
+    normalized_results.sort(key=lambda item: (item["url"], item["title"], item["content"]))
+    normalized = {
+        "website": normalize_domain(website_url),
+        "profile": _normalized_cache_value(profile),
+        "search_results": normalized_results,
+    }
+    payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _safe_error_code(error: Exception) -> str | None:
@@ -87,6 +132,22 @@ EXCLUDED_DOMAINS = {
     "glassdoor.com",
     "zoominfo.com",
     "bloomberg.com",
+    "einpresswire.com",
+    "einpresswire",
+    "prnewswire.com",
+    "prnewswire",
+    "businesswire.com",
+    "businesswire",
+    "globenewswire.com",
+    "globenewswire",
+    "newswire.com",
+    "prweb.com",
+    "accesswire.com",
+    "softwareadvice.com",
+    "getapp.com",
+    "trustradius.com",
+    "trustpilot.com",
+    "selecthub.com",
     "wikipedia.org",
 }
 
@@ -195,11 +256,16 @@ def search_tavily(query: str, api_key: str) -> list[dict]:
 
 async def extract_companies_with_gemini(
     profile: dict,
-    search_results: list[dict]
+    search_results: list[dict],
+    website_url: str = "",
 ) -> list[dict]:
     """Extract potential competing companies from search evidence."""
 
-    _log_diagnostic("gemini_extraction_started", search_result_count=len(search_results))
+    _log_diagnostic(
+        "gemini_extraction_started",
+        analysis_id=current_analysis_id(),
+        search_result_count=len(search_results),
+    )
     if not gemini_client:
         logger.warning("Gemini client is not configured.")
         _log_diagnostic(
@@ -211,6 +277,22 @@ async def extract_companies_with_gemini(
             "Gemini is unavailable for competitor extraction.",
             503
         )
+
+    cache_key = _competitor_cache_key(website_url, profile, search_results)
+    now = time.monotonic()
+    with _COMPETITOR_CACHE_LOCK:
+        cached = _COMPETITOR_EXTRACTION_CACHE.get(cache_key)
+        if cached:
+            expires_at, companies = cached
+            if expires_at > now:
+                _COMPETITOR_EXTRACTION_CACHE.move_to_end(cache_key)
+                _log_diagnostic(
+                    "gemini_extraction_cache_hit",
+                    analysis_id=current_analysis_id(),
+                    candidate_count=len(companies),
+                )
+                return json.loads(json.dumps(companies))
+            _COMPETITOR_EXTRACTION_CACHE.pop(cache_key, None)
 
     evidence = [
         {
@@ -280,13 +362,22 @@ Return valid JSON only in this format:
 
     for attempt in range(max_attempts):
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    gemini_client.models.generate_content,
-                    model=GEMINI_MODEL,
-                    contents=prompt
-                ),
-                timeout=GEMINI_DISCOVERY_TIMEOUT
+            attempt_fields = {
+                "analysis_id": current_analysis_id(),
+                "stage": "competitor_extraction",
+                "attempt": attempt + 1,
+                "model": GEMINI_MODEL,
+            }
+            logger.info(
+                "gemini.request_attempt %s",
+                json.dumps(attempt_fields, sort_keys=True, separators=(",", ":")),
+                extra={"diagnostic_event": "gemini.request_attempt", **attempt_fields},
+            )
+            response = await generate_gemini_content(
+                gemini_client,
+                GEMINI_DISCOVERY_TIMEOUT,
+                model=GEMINI_MODEL,
+                contents=prompt,
             )
 
             if not response.text:
@@ -329,12 +420,22 @@ Return valid JSON only in this format:
 
             _log_diagnostic(
                 "gemini_extraction_succeeded",
+                analysis_id=current_analysis_id(),
                 company_candidate_count=sum(isinstance(item, dict) for item in companies[:8])
             )
-            return [
+            extracted = [
                 company for company in companies
                 if isinstance(company, dict)
             ][:8]
+            with _COMPETITOR_CACHE_LOCK:
+                _COMPETITOR_EXTRACTION_CACHE[cache_key] = (
+                    time.monotonic() + COMPETITOR_CACHE_TTL_SECONDS,
+                    json.loads(json.dumps(extracted)),
+                )
+                _COMPETITOR_EXTRACTION_CACHE.move_to_end(cache_key)
+                while len(_COMPETITOR_EXTRACTION_CACHE) > COMPETITOR_CACHE_MAX_ENTRIES:
+                    _COMPETITOR_EXTRACTION_CACHE.popitem(last=False)
+            return extracted
 
         except Exception as exc:
             if isinstance(exc, ExternalServiceError):
@@ -346,6 +447,7 @@ Return valid JSON only in this format:
                 )
                 _log_diagnostic(
                     "gemini_extraction_failed", level="warning",
+                    analysis_id=current_analysis_id(),
                     error_type=type(exc).__name__, error_code=_safe_error_code(exc),
                     attempt=attempt + 1, max_attempts=max_attempts
                 )
@@ -358,9 +460,11 @@ Return valid JSON only in this format:
                 or getattr(exc, "status", None)
                 or ""
             ).upper()
+            provider_status, _ = _safe_gemini_exception_details(exc)
             retryable = (
                 isinstance(exc, (TimeoutError, asyncio.TimeoutError))
                 or "SERVERERROR" in type(exc).__name__.upper()
+                or provider_status in {429, 500, 502, 503, 504}
                 or any(marker in error_message or marker in error_code for marker in (
                     "500", "INTERNAL", "503", "UNAVAILABLE", "429",
                     "RESOURCE_EXHAUSTED", "RATE_LIMIT", "TIMEOUT",
@@ -369,11 +473,7 @@ Return valid JSON only in this format:
             )
 
             rate_limited = (
-                "429" in error_message
-                or "RESOURCE_EXHAUSTED" in error_message
-                or "RATE_LIMIT" in error_message
-                or "429" in error_code
-                or "RESOURCE_EXHAUSTED" in error_code
+                _gemini_rate_limit_error(exc)
                 or "RATE_LIMIT" in error_code
             )
             if rate_limited:
@@ -384,10 +484,11 @@ Return valid JSON only in this format:
                 type(exc).__name__,
                 attempt + 1,
                 max_attempts,
-                "; retrying" if retryable and attempt < max_attempts - 1 else ""
+                "; retrying" if retryable and not rate_limited and attempt < max_attempts - 1 else ""
             )
             _log_diagnostic(
                 "gemini_extraction_failed", level="warning",
+                analysis_id=current_analysis_id(),
                 error_type=type(exc).__name__, error_code=_safe_error_code(exc),
                 attempt=attempt + 1, max_attempts=max_attempts,
                 retrying=bool(
@@ -395,8 +496,15 @@ Return valid JSON only in this format:
                 )
             )
 
-            if retryable and not rate_limited and attempt < max_attempts - 1:
-                await asyncio.sleep(min(0.5 * (2 ** attempt), 1.5))
+            if rate_limited:
+                raise ExternalServiceError(
+                    "gemini_rate_limited",
+                    "Gemini is temporarily rate limited. Please wait before trying again.",
+                    503,
+                ) from exc
+
+            if retryable and attempt < max_attempts - 1:
+                await asyncio.sleep(_retry_delay(attempt, exc))
                 continue
 
             raise classify_external_error("Gemini", exc) from exc
@@ -548,7 +656,45 @@ _NON_COMPANY_CANDIDATE_NAMES = {
     "comparison sites",
     "company directory",
     "business directory",
+    "ein presswire",
+    "einpresswire",
+    "einpresswire com",
+    "pr newswire",
+    "prnewswire",
+    "prnewswire com",
+    "business wire",
+    "businesswire",
+    "businesswire com",
+    "globe newswire",
+    "globenewswire",
+    "globenewswire com",
+    "newswire",
+    "press release",
+    "press releases",
+    "g2",
+    "capterra",
+    "software advice",
+    "getapp",
+    "trust radius",
+    "trustpilot",
+    "selecthub",
 }
+
+_AMBIGUOUS_SINGLE_WORD_NAMES = {
+    "what", "market", "marketplace", "platform", "commerce", "software",
+    "company", "solutions", "solution", "news", "reviews", "review",
+}
+
+
+def _has_specific_candidate_product(company: dict) -> bool:
+    name_tokens = set(normalize_company_name(str(company.get("name", ""))).split())
+    product_tokens = set(normalize_company_name(str(company.get("product_name", ""))).split())
+    product_tokens -= name_tokens
+    product_tokens -= {
+        "app", "apps", "cloud", "platform", "plus", "pro", "product",
+        "service", "services", "software", "suite", "tool", "tools",
+    }
+    return bool(product_tokens)
 
 
 def is_publisher_candidate(company: dict) -> bool:
@@ -560,7 +706,9 @@ def is_publisher_candidate(company: dict) -> bool:
     # These phrases describe editorial or catalog content, not a distinct
     # operating company or product. Keep the rule name-based and conservative
     # so branded commerce vendors such as BigCommerce remain eligible.
-    return name in _NON_COMPANY_CANDIDATE_NAMES
+    if name in _NON_COMPANY_CANDIDATE_NAMES:
+        return True
+    return name in _AMBIGUOUS_SINGLE_WORD_NAMES and not _has_specific_candidate_product(company)
 
 
 async def discover_official_websites(
@@ -902,7 +1050,7 @@ def validate_company_evidence(
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", context)
         if sentence.strip()
     ]
-    product_supported = bool(product_name) and any(
+    product_supported = _has_specific_candidate_product(company) and any(
         company_name_matches_text(name, sentence)
         and company_name_matches_text(product_name, sentence)
         for sentence in context_sentences
@@ -1004,9 +1152,8 @@ def rank_candidates_by_evidence(candidates: list[dict]) -> list[dict]:
     evidence_tiers = {
         "explicit_competitor_relationship_found": 4,
         "product_or_capability_comparison_found": 3,
-        "company_and_product_mentioned": 2,
-        "company_mentioned": 1,
     }
+    fetched_excerpt_classes = set(evidence_tiers)
     eligible = []
     for candidate in candidates:
         try:
@@ -1021,13 +1168,21 @@ def rank_candidates_by_evidence(candidates: list[dict]) -> list[dict]:
             continue
         if candidate.get("evidence_status") not in evidence_tiers:
             continue
+        if (
+            normalize_company_name(str(candidate.get("name", ""))) in _AMBIGUOUS_SINGLE_WORD_NAMES
+            and (
+                candidate.get("verification_status") != "official_website_validated"
+                or not _has_specific_candidate_product(candidate)
+            )
+        ):
+            continue
 
         details = candidate.get("evidence_details", [])
         if not isinstance(details, list):
             continue
         has_fetched_evidence = any(
             detail.get("accessible") is True
-            and detail.get("classification") in evidence_tiers
+            and detail.get("classification") in fetched_excerpt_classes
             and any(
                 isinstance(excerpt, dict)
                 and isinstance(excerpt.get("matched_text"), str)
@@ -1227,7 +1382,7 @@ async def discover_competitors(
         )
     else:
         try:
-            companies = await extract_companies_with_gemini(profile, unique_results)
+            companies = await extract_companies_with_gemini(profile, unique_results, website_url)
         except ExternalServiceError as error:
             gemini_fallback_used = True
             cooldown_seconds, cooldown_reason = gemini_cooldown_remaining()

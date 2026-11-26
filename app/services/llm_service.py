@@ -6,9 +6,13 @@ import hashlib
 import json
 import logging
 import re
+import random
 import threading
 import time
+import contextvars
 from collections import OrderedDict
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 
 from google import genai
 from google.genai import types
@@ -22,17 +26,79 @@ from app.utils.errors import (
 
 logger = logging.getLogger(__name__)
 GEMINI_REQUEST_TIMEOUT = 20
+GEMINI_MAX_OUTPUT_TOKENS = 8192
 PRIMARY_GEMINI_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_GEMINI_MODEL = "gemini-3.1-flash-lite"
 ANALYSIS_CACHE_TTL_SECONDS = 900
 ANALYSIS_CACHE_MAX_ENTRIES = 64
 GEMINI_RATE_LIMIT_COOLDOWN_SECONDS = 60
 GEMINI_TRANSIENT_COOLDOWN_SECONDS = 15
+GEMINI_MAX_CONCURRENT_REQUESTS = 2
+GEMINI_RETRY_MAX_DELAY_SECONDS = 8.0
+_GEMINI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(GEMINI_MAX_CONCURRENT_REQUESTS)
+_ANALYSIS_ID = contextvars.ContextVar("linkly_analysis_id", default="unknown")
 _GEMINI_STATE_LOCK = threading.Lock()
 _ANALYSIS_CACHE: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _ANALYSIS_INFLIGHT: dict[str, asyncio.Task] = {}
 _GEMINI_COOLDOWN_UNTIL = 0.0
 _GEMINI_COOLDOWN_REASON = ""
+
+
+def set_analysis_id(analysis_id: str):
+    return _ANALYSIS_ID.set(analysis_id)
+
+
+def reset_analysis_id(token) -> None:
+    _ANALYSIS_ID.reset(token)
+
+
+def current_analysis_id() -> str:
+    return _ANALYSIS_ID.get()
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if not headers:
+        headers = getattr(error, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, delay)
+
+
+def _retry_delay(attempt: int, error: Exception) -> float:
+    exponential = min(0.5 * (2 ** attempt), GEMINI_RETRY_MAX_DELAY_SECONDS)
+    delay = random.uniform(exponential * 0.5, exponential * 1.5)
+    retry_after = _retry_after_seconds(error)
+    if retry_after is not None:
+        return retry_after
+    return min(delay, GEMINI_RETRY_MAX_DELAY_SECONDS)
+
+
+def _limited_generate_content(client_instance, kwargs):
+    # The semaphore lives in the worker thread so a coroutine timeout cannot
+    # release capacity while the underlying synchronous SDK request is active.
+    with _GEMINI_REQUEST_SEMAPHORE:
+        return client_instance.models.generate_content(**kwargs)
+
+
+async def generate_gemini_content(client_instance, timeout: float, **kwargs):
+    return await asyncio.wait_for(
+        asyncio.to_thread(_limited_generate_content, client_instance, kwargs),
+        timeout=timeout,
+    )
 
 
 def _safe_gemini_exception_details(error: Exception) -> tuple[int | None, str]:
@@ -75,7 +141,9 @@ def activate_gemini_cooldown(error: Exception) -> float:
     global _GEMINI_COOLDOWN_UNTIL, _GEMINI_COOLDOWN_REASON
     status_code, message = _safe_gemini_exception_details(error)
     if _gemini_rate_limit_error(error):
-        duration = GEMINI_RATE_LIMIT_COOLDOWN_SECONDS
+        duration = _retry_after_seconds(error)
+        if duration is None:
+            duration = GEMINI_RATE_LIMIT_COOLDOWN_SECONDS
         reason = "gemini_rate_limited"
     elif (
         status_code in {502, 503, 504}
@@ -129,7 +197,6 @@ async def _run_and_cache_analysis(key: str, website_data: dict) -> dict:
         with _GEMINI_STATE_LOCK:
             if _ANALYSIS_INFLIGHT.get(key) is asyncio.current_task():
                 _ANALYSIS_INFLIGHT.pop(key, None)
-
 
 async def analyze_with_ai(website_data: dict) -> dict:
     """Coalesce identical page analyses and cache successful results briefly."""
@@ -622,6 +689,8 @@ def _log_gemini_response_failure(
     invalid = invalid_fields or []
     diagnostic = {
         "diagnostic_event": "gemini.response_validation_failed",
+        "analysis_id": current_analysis_id(),
+        "stage": "core_analysis",
         "failure_category": failure_category,
         "missing_fields": missing,
         "invalid_fields": invalid,
@@ -707,6 +776,79 @@ def _find_source_quote(phrase: str, source_text: str) -> str | None:
     pattern = pattern.replace(r"\ ", r"\s+")
     match = re.search(rf"(?<!\w){pattern}(?!\w)", source_text, re.IGNORECASE)
     return match.group(0) if match else None
+
+
+def _supports_audience_relation(claim: str, quote: str) -> bool:
+    """Check that a source sentence naturally connects the audience phrase."""
+    claim_tokens = set(_normalize_keyword(claim).split()) - KEYWORD_STOP_WORDS
+    if not claim_tokens:
+        return False
+    phrase = re.escape(claim.strip())
+    phrase = phrase.replace(r"\ ", r"\s+")
+    relation = (
+        r"(?:serves?|supports?|helps?|benefits?|empowers?|designed for|built for|"
+        r"created for|developed for|made for|tailored for|works? for|works? with|"
+        r"caters? to|aims? at|focuses? on|used by|trusted by|adopted by|"
+        r"popular among|customers? include|customers? are|audience is|for)"
+    )
+    for sentence in re.split(r"(?<=[.!?])\s+|[\r\n]+", quote):
+        sentence_tokens = set(_normalize_keyword(sentence).split()) - KEYWORD_STOP_WORDS
+        if not claim_tokens.issubset(sentence_tokens):
+            continue
+        # Accept both common subject/object forms and audience descriptions
+        # such as "our customers are mostly small retailers".
+        if (
+            re.search(rf"\b{relation}\b(?:\s+\w+){{0,6}}\s+{phrase}(?!\w)", sentence, re.I)
+            or re.search(rf"(?<!\w){phrase}(?:[,;:]?)\s+(?:\w+\s+){{0,8}}\b(?:use|uses|choose|trust|rely on|benefit from)\b", sentence, re.I)
+            or re.search(rf"(?<!\w){phrase}(?:[,;:]?)\s+(?:can|often|typically|usually)\s+(?:use|manage|need|face|solve|handle|reduce|improve|benefit)\b", sentence, re.I)
+            or re.search(rf"(?<!\w){phrase}\s+(?:make up|form|constitute|represent|account for)\b", sentence, re.I)
+            or re.search(rf"(?<!\w){phrase}\s+are\s+(?:(?:our|the|a)\s+)?(?:customers?|clients?|users?|target audience|primary market|largest customer group|main user group)\b", sentence, re.I)
+            or re.search(rf"(?<!\w){phrase}\s+(?:are\s+)?(?:popular|common|preferred|well known)\s+(?:with|among|to)\b", sentence, re.I)
+            or re.search(rf"\b(?:customers?|clients?|users?|audience|user base)\b(?:\s+\w+){{0,5}}\s+{phrase}(?!\w)", sentence, re.I)
+        ):
+            return True
+    return False
+
+
+def _source_sentence_for_claim(claim: str, source_text: str) -> str | None:
+    """Find the extracted sentence that contains a direct claim phrase."""
+    for sentence in re.split(r"(?<=[.!?])\s+|[\r\n]+", source_text):
+        sentence = sentence.strip()
+        if sentence and _source_supports_phrase(claim, sentence):
+            return sentence
+    return None
+
+
+def _source_audience_range(source_text: str) -> dict | None:
+    """Find explicit inclusive audience ranges such as 'from A to B'."""
+    for sentence in re.split(r"(?<=[.!?])\s+|[\r\n]+", source_text):
+        match = re.search(
+            r"\b(?:anyone|everyone|businesses|companies|teams)?\s*from\s+"
+            r"(?P<start>[\w '&-]+?)\s+to\s+(?P<end>[\w '&-]+?)\s*[.!?,;]*$",
+            sentence.strip(),
+            re.IGNORECASE,
+        )
+        if match:
+            start = match.group("start").strip(" ,")
+            end = match.group("end").strip(" ,")
+            if start and end:
+                return {
+                    "sentence": sentence.strip(),
+                    "start": start,
+                    "end": end,
+                    "claim": f"{start} to {end}",
+                }
+    return None
+
+
+def _range_endpoint_claim(claim: str, audience_range: dict | None) -> bool:
+    if not audience_range:
+        return False
+    normalized = _normalize_keyword(claim)
+    return normalized in {
+        _normalize_keyword(audience_range["start"]),
+        _normalize_keyword(audience_range["end"]),
+    }
 
 
 def _keyword_is_branded(keyword: str, brand_name: str, product_names: list[str]) -> bool:
@@ -1142,7 +1284,7 @@ def filter_supported_industry_segments(
     evidence_items: list,
     website_data: dict | None,
 ) -> tuple[list[str], list[dict]]:
-    """Keep only industry labels with a source quote from the fetched page."""
+    """Keep only defensible industry labels stated in relevant source text."""
     if not isinstance(evidence_items, list):
         raise ValueError("Industry segment evidence must be a list.")
     source_text = _source_text(website_data)
@@ -1156,20 +1298,22 @@ def filter_supported_industry_segments(
         reason = evidence.get("reason", "")
         if not all(isinstance(value, str) for value in (industry, basis, quote, reason)):
             raise ValueError("Industry segment evidence fields must be strings.")
-        if basis not in {"observed", "inferred"} or not industry.strip() or not quote.strip():
+        if (
+            basis not in {"observed", "inferred"}
+            or not industry.strip()
+            or not quote.strip()
+            or _is_non_industry_audience_label(industry)
+        ):
             continue
         if basis == "inferred" and not reason.strip():
             continue
         if not _source_supports_phrase(quote, source_text):
             continue
-        if basis == "observed":
-            if not _source_supports_phrase(industry, quote):
-                continue
-        else:
-            industry_tokens = set(_normalize_keyword(industry).split()) - KEYWORD_STOP_WORDS
-            quote_tokens = set(_normalize_keyword(quote).split()) - KEYWORD_STOP_WORDS
-            if not industry_tokens.intersection(quote_tokens):
-                continue
+        # A shared token (for example, "finance" in a Company OS audience
+        # list) is not enough. The proposed classification must occur as a
+        # phrase in the source quote and must not be a role/team label.
+        if not _source_supports_phrase(industry, quote):
+            continue
         valid_by_name.setdefault(_normalize_keyword(industry), {
             "industry": industry.strip(),
             "basis": basis,
@@ -1177,14 +1321,13 @@ def filter_supported_industry_segments(
             "reason": reason.strip(),
         })
 
-    # Older or incomplete model responses may omit provenance objects even
-    # when an industry label is stated directly in the fetched page. Restore
-    # only those exact observations; inferred labels still need AI evidence.
+    # Restore only industry phrases found in a source sentence. Never recover
+    # a label from a word-only match across the concatenated page text.
     for industry in industries:
-        if not isinstance(industry, str):
+        if not isinstance(industry, str) or _is_non_industry_audience_label(industry):
             continue
         key = _normalize_keyword(industry)
-        quote = _find_source_quote(industry, source_text)
+        quote = _source_sentence_for_claim(industry, source_text)
         if key and quote:
             valid_by_name.setdefault(key, {
                 "industry": industry.strip(),
@@ -1212,11 +1355,116 @@ def filter_supported_industry_segments(
     return clean_industries, clean_evidence
 
 
+NON_INDUSTRY_AUDIENCE_LABELS = {
+    "engineering", "sales", "customer support", "customer service",
+    "support", "finance", "marketing", "human resources", "hr",
+    "design", "product", "operations", "it", "legal",
+}
+
+
+def _is_non_industry_audience_label(value: str) -> bool:
+    normalized = _normalize_keyword(value)
+    tokens = normalized.split()
+    return (
+        normalized in NON_INDUSTRY_AUDIENCE_LABELS
+        or any(token in {"team", "teams", "department", "departments", "function", "functions"} for token in tokens)
+    )
+
+
+SERVICE_NAME_STOP_WORDS = KEYWORD_STOP_WORDS | {
+    "ai", "app", "apps", "cloud", "company", "os", "platform", "product",
+    "service", "services", "software", "suite", "system", "tool", "tools",
+}
+GENERIC_OFFERING_NAMES = {
+    "company os", "business os", "company platform", "business platform",
+    "operating system", "software platform", "all in one platform",
+}
+
+
+def _source_sentences(website_data: dict | None) -> list[str]:
+    source_text = _source_text(website_data)
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+|[\r\n]+", source_text)
+        if sentence.strip()
+    ]
+
+
+def _source_sentence_for_quote(quote: str, website_data: dict | None) -> str | None:
+    """Resolve a short model quote to one exact extracted source sentence."""
+    normalized_quote = _normalize_keyword(quote)
+    if not normalized_quote or len(normalized_quote) > 500:
+        return None
+    for sentence in _source_sentences(website_data):
+        if _source_supports_phrase(quote, sentence):
+            return sentence
+    return None
+
+
+def _service_source_sentences(service: dict, website_data: dict | None) -> list[str]:
+    """Find source sentences that name or specifically describe this offering."""
+    name = str(service.get("name", "")).strip()
+    if not name or _normalize_keyword(name) in GENERIC_OFFERING_NAMES:
+        return []
+    sentences = _source_sentences(website_data)
+    explicit = [
+        sentence for sentence in sentences
+        if _source_supports_phrase(name, sentence)
+    ]
+    if explicit:
+        return explicit
+    if service.get("inferred") is not True:
+        return []
+
+    name_tokens = set(_normalize_keyword(name).split()) - SERVICE_NAME_STOP_WORDS
+    description_tokens = set(_normalize_keyword(str(service.get("description", ""))).split()) - KEYWORD_STOP_WORDS
+    if len(name_tokens) < 2:
+        return []
+    return [
+        sentence for sentence in sentences
+        if len(name_tokens & set(_normalize_keyword(sentence).split())) >= 2
+        and len(description_tokens & set(_normalize_keyword(sentence).split())) >= 2
+    ]
+
+
+def _service_text_claim_supported(claim: str, service: dict, source_sentences: list[str]) -> bool:
+    """Match descriptive claims to an offering-specific sentence, including its numbers."""
+    claim = claim.strip()
+    if not claim or claim.casefold() == "not available":
+        return True
+    name_tokens = set(_normalize_keyword(str(service.get("name", ""))).split())
+    claim_tokens = set(_normalize_keyword(claim).split()) - KEYWORD_STOP_WORDS - name_tokens
+    if not claim_tokens:
+        return False
+    number_words = {
+        "zero", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "ten", "eleven", "twelve", "dozen", "hundred",
+        "thousand", "million", "billion", "trillion", "first", "second",
+        "third", "double", "triple", "twice", "once",
+    }
+    claim_numbers = set(re.findall(r"(?<!\w)\d+(?:[,.]\d+)*(?:%|x)?", claim.casefold()))
+    claim_numbers.update(set(_normalize_keyword(claim).split()) & number_words)
+    for sentence in source_sentences:
+        sentence_tokens = set(_normalize_keyword(sentence).split()) - KEYWORD_STOP_WORDS - name_tokens
+        sentence_numbers = set(re.findall(r"(?<!\w)\d+(?:[,.]\d+)*(?:%|x)?", sentence.casefold()))
+        sentence_numbers.update(set(_normalize_keyword(sentence).split()) & number_words)
+        if not claim_numbers.issubset(sentence_numbers):
+            continue
+        if _source_supports_phrase(claim, sentence):
+            return True
+        overlap = claim_tokens & sentence_tokens
+        if len(overlap) >= min(2, len(claim_tokens)) and len(overlap) / len(claim_tokens) >= 0.6:
+            return True
+    return False
+
+
 def _service_audience_evidence(
     claim: str,
     context: str,
     field: str,
     website_data: dict | None,
+    *,
+    require_context: bool = True,
 ) -> dict | None:
     """Ground a service-derived audience claim in exact page text."""
     claim = re.sub(r"\s*\(inferred\)\s*$", "", claim.strip(), flags=re.IGNORECASE)
@@ -1224,12 +1472,24 @@ def _service_audience_evidence(
         return None
 
     source_text = _source_text(website_data)
-    quote = _find_source_quote(claim, source_text)
+    quote = _source_sentence_for_claim(claim, source_text)
     basis = "observed"
     reason = "The extracted page directly names this audience or industry."
+    claim_tokens = set(_normalize_keyword(claim).split()) - KEYWORD_STOP_WORDS
+    context_tokens = (
+        set(_normalize_keyword(context).split())
+        - KEYWORD_STOP_WORDS
+        - claim_tokens
+    )
+    if quote:
+        quote_tokens = set(_normalize_keyword(quote).split()) - KEYWORD_STOP_WORDS
+        if (
+            not _supports_audience_relation(claim, quote)
+            or (require_context and not (context_tokens & quote_tokens))
+        ):
+            quote = None
     if not quote:
         claim_tokens = set(_normalize_keyword(claim).split()) - KEYWORD_STOP_WORDS
-        context_tokens = set(_normalize_keyword(context).split()) - KEYWORD_STOP_WORDS
         if not claim_tokens or not context_tokens:
             return None
 
@@ -1253,9 +1513,13 @@ def _service_audience_evidence(
 
         for segment in source_segments:
             segment_tokens = set(_normalize_keyword(segment).split()) - KEYWORD_STOP_WORDS
-            claim_overlap = claim_tokens & segment_tokens
             context_overlap = context_tokens & segment_tokens
-            if claim_overlap and context_overlap:
+            if (
+                claim_tokens
+                and claim_tokens.issubset(segment_tokens)
+                and context_overlap
+                and _supports_audience_relation(claim, segment)
+            ):
                 quote = segment
                 break
         if not quote:
@@ -1305,7 +1569,8 @@ def consolidate_service_audience_evidence(
             industry = service.get("target_industry")
             if isinstance(industry, str) and industry.strip():
                 evidence = _service_audience_evidence(
-                    industry, context, "industry_segments", website_data
+                    industry, context, "industry_segments", website_data,
+                    require_context=False,
                 )
                 if evidence:
                     industry_candidates.append((evidence["claim"], evidence))
@@ -1321,6 +1586,7 @@ def consolidate_service_audience_evidence(
             " ".join(str(service.get("name", "")) for service in services if isinstance(service, dict)),
             "customer_profiles",
             website_data,
+            require_context=False,
         )
         if evidence:
             customer_candidates.append((business_type, "", evidence))
@@ -1374,6 +1640,59 @@ def consolidate_service_audience_evidence(
     return audience
 
 
+def validate_service_audience_claims(services: list, website_data: dict | None) -> list:
+    """Ground service names, descriptions, benefits and audience fields to each offering."""
+    if not isinstance(services, list):
+        return services
+    for service in services:
+        if not isinstance(service, dict):
+            continue
+        context = " ".join((
+            str(service.get("name", "")),
+            str(service.get("description", "")),
+        ))
+        source_sentences = _service_source_sentences(service, website_data)
+        if not source_sentences:
+            service["name"] = "Not available"
+            service["description"] = "Not available"
+            service["business_benefit"] = "Not available"
+            service["target_customer"] = "Not available"
+            service["target_industry"] = "Not available"
+            service["inferred"] = True
+            continue
+
+        scoped_website_data = {"content": " ".join(source_sentences)}
+        for field in ("description", "business_benefit"):
+            value = service.get(field)
+            if not isinstance(value, str) or not _service_text_claim_supported(value, service, source_sentences):
+                service[field] = "Not available"
+
+        for field in ("target_customer", "target_industry"):
+            value = service.get(field)
+            if not isinstance(value, str) or not value.strip() or value.casefold() == "not available":
+                service[field] = "Not available"
+                continue
+
+            claim = re.sub(r"\s*\(inferred\)\s*$", "", value.strip(), flags=re.IGNORECASE)
+            if field == "target_industry" and _is_non_industry_audience_label(claim):
+                service[field] = "Not available"
+                continue
+            evidence = _service_audience_evidence(
+                claim,
+                context,
+                field,
+                scoped_website_data,
+                require_context=True,
+            )
+            if not evidence:
+                service[field] = "Not available"
+            elif evidence["basis"] == "inferred":
+                service[field] = f"{claim} (Inferred)"
+            else:
+                service[field] = claim
+    return services
+
+
 def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
     """Map only audience claims backed by validated website evidence."""
     allowed_fields = {
@@ -1385,6 +1704,7 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
     if not isinstance(evidence_items, list):
         raise ValueError("Audience evidence must be a list.")
     source_text = _source_text(website_data)
+    audience_range = _source_audience_range(source_text)
     valid_evidence = {}
     for evidence in evidence_items:
         if not isinstance(evidence, dict):
@@ -1398,21 +1718,35 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
             raise ValueError("Audience evidence fields must be strings.")
         if field not in allowed_fields or basis not in {"observed", "inferred"}:
             continue
-        if (
-            not claim.strip()
-            or claim.casefold() == "not available"
-            or not quote.strip()
-            or not _source_supports_phrase(quote, source_text)
-        ):
+        if not claim.strip() or claim.casefold() == "not available" or not quote.strip():
             continue
-        if basis == "observed" and not _source_supports_phrase(claim, quote):
+        # Keep only source-backed snippets that resolve to one short passage.
+        # Replace model formatting with the exact page sentence shown in the UI.
+        quote = _source_sentence_for_quote(quote, website_data)
+        if not quote:
             continue
+        is_range_quote = bool(
+            audience_range
+            and _source_supports_phrase(audience_range["sentence"], quote)
+        )
+        if is_range_quote and _range_endpoint_claim(claim, audience_range):
+            if field in {"primary_audience", "secondary_audience"}:
+                field = "primary_audience"
+                claim = audience_range["claim"]
+                quote = audience_range["sentence"]
+                basis = "observed"
+                reason = "The page explicitly describes this audience range."
+            else:
+                continue
+        if basis == "observed":
+            if not _source_supports_phrase(claim, quote):
+                continue
+            if field != "needs_and_challenges" and not _supports_audience_relation(claim, quote):
+                continue
         if basis == "inferred" and not reason.strip():
             continue
         if basis == "inferred":
-            claim_tokens = set(_normalize_keyword(claim).split()) - KEYWORD_STOP_WORDS
-            quote_tokens = set(_normalize_keyword(quote).split()) - KEYWORD_STOP_WORDS
-            if not claim_tokens.intersection(quote_tokens):
+            if not reason.strip() or not _supports_audience_relation(claim, quote):
                 continue
         valid_evidence.setdefault((
             field,
@@ -1442,8 +1776,26 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
                 for evidence_field, evidence_claim, _, _ in valid_evidence
             ):
                 continue
-            quote = _find_source_quote(claim, source_text)
-            if quote and claim.casefold() != "not available":
+            quote = _source_sentence_for_claim(claim, source_text)
+            if (
+                quote
+                and audience_range
+                and _source_supports_phrase(audience_range["sentence"], quote)
+                and _range_endpoint_claim(claim, audience_range)
+            ):
+                if field in {"primary_audience", "secondary_audience"}:
+                    if field == "secondary_audience":
+                        continue
+                    claim = audience_range["claim"]
+                    normalized_claim = _normalize_keyword(claim)
+                    quote = audience_range["sentence"]
+                else:
+                    continue
+            if (
+                quote
+                and claim.casefold() != "not available"
+                and (field == "needs_and_challenges" or _supports_audience_relation(claim, quote))
+            ):
                 valid_evidence[(field, normalized_claim, "observed", quote)] = {
                     "field": field,
                     "claim": claim.strip(),
@@ -1451,6 +1803,21 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
                     "supporting_text": quote,
                     "reason": "",
                 }
+
+    if audience_range:
+        range_key = (
+            "primary_audience",
+            _normalize_keyword(audience_range["claim"]),
+            "observed",
+            audience_range["sentence"],
+        )
+        valid_evidence[range_key] = {
+            "field": "primary_audience",
+            "claim": audience_range["claim"],
+            "basis": "observed",
+            "supporting_text": audience_range["sentence"],
+            "reason": "The page explicitly describes this audience range.",
+        }
 
     for field in allowed_fields:
         value = audience[field]
@@ -1486,6 +1853,18 @@ def ground_audience_claims(audience: dict, website_data: dict | None) -> dict:
             audience[field] = evidence_claims[0]
         else:
             audience[field] = "Not available"
+
+    if audience_range:
+        audience["primary_audience"] = audience_range["claim"]
+        secondary_claim = audience.get("secondary_audience", "")
+        has_independent_secondary = any(
+            evidence.get("field") == "secondary_audience"
+            and _normalize_keyword(evidence.get("claim", "")) == _normalize_keyword(secondary_claim)
+            and not _source_supports_phrase(audience_range["sentence"], evidence.get("supporting_text", ""))
+            for evidence in valid_evidence.values()
+        )
+        if _range_endpoint_claim(secondary_claim, audience_range) and not has_independent_secondary:
+            audience["secondary_audience"] = "Not available"
     deduplicated_evidence = {}
     for evidence in valid_evidence.values():
         key = (
@@ -1583,6 +1962,16 @@ def validate_analysis(result: dict, website_data: dict | None = None) -> dict:
             raise ValueError(
                 f"Competitor field {field} must be a list."
             )
+
+    if isinstance(website_data, dict):
+        source_text = _source_text(website_data)
+        competitor["products_services"] = [
+            item for item in competitor["products_services"]
+            if isinstance(item, str)
+            and item.strip()
+            and _source_supports_phrase(item.strip(), source_text)
+            and _normalize_keyword(item) not in GENERIC_OFFERING_NAMES
+        ]
 
     for item in competitor["competitors"]:
 
@@ -1693,6 +2082,20 @@ def validate_analysis(result: dict, website_data: dict | None = None) -> dict:
     result["top_services"] = normalize_inferred_fields(
         services
     )
+    validate_service_audience_claims(result["top_services"], website_data)
+    # Gemini is asked for five candidates to preserve its response contract,
+    # but only grounded offerings should leave validation. Placeholder and
+    # unsupported inferred entries otherwise become blank-looking UI cards.
+    result["top_services"] = [
+        service for service in result["top_services"]
+        if isinstance(service, dict)
+        and isinstance(service.get("name"), str)
+        and service["name"].strip()
+        and service["name"].strip().casefold() != "not available"
+        and isinstance(service.get("description"), str)
+        and service["description"].strip()
+        and service["description"].strip().casefold() != "not available"
+    ]
 
     # --------------------------------------------------------
     # TARGET AUDIENCE
@@ -1925,9 +2328,8 @@ IMPORTANT SOURCE RULES:
    with clearly labelled AI-generated suggestions and
    set inferred=true for those entries.
 
-9. Include competitor names only when they are reasonably
-   known and relevant. Do not claim they were verified
-   from the supplied website.
+9. Return an empty competitors array. Evidence-based competitor
+   discovery runs separately and validates all discovered companies.
 
 10. If competitor information is unavailable, return an
     empty competitors array [].
@@ -2038,8 +2440,8 @@ STRICT OUTPUT RULES:
    Set platform_type to the matching type. Never label a social network
    as a search engine and do not force one query per platform.
 
-4. Include relevant competitors only when reasonably
-   supported by available information.
+4. Return an empty competitors array; evidence-based competitor
+   discovery runs separately and validates all discovered companies.
 
 5. Do not invent search volumes, rankings, percentages,
    customer counts, revenue figures or factual statistics.
@@ -2186,17 +2588,27 @@ STRICT OUTPUT RULES:
 
         try:
 
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    client.models.generate_content,
-                    model=active_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.2
-                    )
+            attempt_fields = {
+                "analysis_id": current_analysis_id(),
+                "stage": "core_analysis",
+                "attempt": attempt + 1,
+                "model": active_model,
+            }
+            logger.info(
+                "gemini.request_attempt %s",
+                json.dumps(attempt_fields, sort_keys=True, separators=(",", ":")),
+                extra={"diagnostic_event": "gemini.request_attempt", **attempt_fields},
+            )
+            response = await generate_gemini_content(
+                client,
+                GEMINI_REQUEST_TIMEOUT + 3,
+                model=active_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
                 ),
-                timeout=GEMINI_REQUEST_TIMEOUT + 3
             )
 
             finish_reason, response_metadata = _gemini_response_diagnostics(response)
@@ -2330,6 +2742,11 @@ STRICT OUTPUT RULES:
                     502
                 ) from error
 
+            # Competitor suggestions are generated from Tavily evidence in the
+            # discovery stage; keep this required analysis section empty here.
+            validated_result = copy.deepcopy(validated_result)
+            validated_result["competitor_analysis"]["competitors"] = []
+
             # Add ML-based competitor ranking.
             validated_result["seo_analysis"]["metadata_assessment"] = (
                 build_metadata_assessment(website_data, validated_result["seo_analysis"])
@@ -2342,6 +2759,8 @@ STRICT OUTPUT RULES:
                 active_model,
                 extra={
                     "diagnostic_event": "gemini.analysis_succeeded",
+                    "analysis_id": current_analysis_id(),
+                    "stage": "core_analysis",
                     "model": active_model,
                 },
             )
@@ -2365,14 +2784,36 @@ STRICT OUTPUT RULES:
                         "cooldown_seconds": round(cooldown),
                     },
                 )
+            if rate_limited:
+                diagnostic = {
+                    "diagnostic_event": "gemini.request_failed",
+                    "analysis_id": current_analysis_id(),
+                    "stage": "core_analysis",
+                    "attempt": attempt + 1,
+                    "max_attempts": attempt + 1,
+                    "retrying": False,
+                    "model": active_model,
+                    "error_type": type(error).__name__,
+                    "status_code": provider_status or 429,
+                    "error_message": safe_error_message,
+                }
+                logger.warning(
+                    "gemini.request_failed %s",
+                    json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+                    extra=diagnostic,
+                )
+                raise ExternalServiceError(
+                    "gemini_rate_limited",
+                    "Gemini is temporarily rate limited. Please wait before trying again.",
+                    503,
+                ) from error
+
             temporary_error = provider_error and (
                 any(
                     term in error_message
                     for term in [
                         "503",
                         "UNAVAILABLE",
-                        "429",
-                        "RESOURCE_EXHAUSTED",
                         "500",
                         "INTERNAL",
                         "TIMEOUT",
@@ -2384,12 +2825,13 @@ STRICT OUTPUT RULES:
             )
             retrying = (
                 temporary_error
-                and not rate_limited
                 and not fallback_model_used
                 and attempt < max_attempts - 1
             )
             diagnostic = {
                 "diagnostic_event": "gemini.request_failed",
+                "analysis_id": current_analysis_id(),
+                "stage": "core_analysis",
                 "attempt": attempt + 1,
                 "max_attempts": 1 if fallback_model_used else max_attempts,
                 "retrying": retrying,
@@ -2405,13 +2847,12 @@ STRICT OUTPUT RULES:
             )
 
             if retrying:
-                await asyncio.sleep(min(0.5 * (2 ** attempt), 1.5))
+                await asyncio.sleep(_retry_delay(attempt, error))
                 attempt += 1
                 continue
 
             fallback_eligible = provider_error and (
-                not rate_limited
-                and (
+                (
                     provider_status in {502, 503, 504}
                     or isinstance(error, TimeoutError)
                     or any(
@@ -2439,6 +2880,8 @@ STRICT OUTPUT RULES:
                     attempt + 1,
                     extra={
                         "diagnostic_event": "gemini.model_fallback",
+                        "analysis_id": current_analysis_id(),
+                        "stage": "core_analysis",
                         "primary_model": active_model,
                         "fallback_model": FALLBACK_GEMINI_MODEL,
                         "after_attempts": attempt + 1,

@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -35,6 +36,7 @@ def _gemini_company_extraction(monkeypatch, outcomes):
         type("Client", (), {"models": FakeModels()})()
     )
     monkeypatch.setattr(competitor_discovery, "GEMINI_DISCOVERY_TIMEOUT", 20)
+    monkeypatch.setattr(llm_service.random, "uniform", lambda low, high: (low + high) / 2)
     delays = []
 
     async def record_sleep(delay):
@@ -55,12 +57,16 @@ def _reset_gemini_runtime_state():
         llm_service._ANALYSIS_INFLIGHT.clear()
         llm_service._GEMINI_COOLDOWN_UNTIL = 0.0
         llm_service._GEMINI_COOLDOWN_REASON = ""
+    with competitor_discovery._COMPETITOR_CACHE_LOCK:
+        competitor_discovery._COMPETITOR_EXTRACTION_CACHE.clear()
     yield
     with llm_service._GEMINI_STATE_LOCK:
         llm_service._ANALYSIS_CACHE.clear()
         llm_service._ANALYSIS_INFLIGHT.clear()
         llm_service._GEMINI_COOLDOWN_UNTIL = 0.0
         llm_service._GEMINI_COOLDOWN_REASON = ""
+    with competitor_discovery._COMPETITOR_CACHE_LOCK:
+        competitor_discovery._COMPETITOR_EXTRACTION_CACHE.clear()
 
 
 def test_company_extraction_succeeds_on_first_attempt(monkeypatch):
@@ -99,7 +105,7 @@ def test_gemini_server_error_uses_one_bounded_retry(monkeypatch):
     assert delays == [0.5]
 
 
-def test_company_extraction_stops_immediately_on_quota_exhaustion(monkeypatch, caplog):
+def test_company_extraction_does_not_retry_quota_exhaustion(monkeypatch, caplog):
     calls = {"count": 0}
 
     class FakeModels:
@@ -128,6 +134,7 @@ def test_company_extraction_stops_immediately_on_quota_exhaustion(monkeypatch, c
     assert calls["count"] == 1
     assert delays == []
     assert raised.value.code == "gemini_rate_limited"
+    assert "temporarily rate limited" in raised.value.public_message
     attempt_records = [
         record for record in caplog.records
         if getattr(record, "diagnostic_event", None) == "competitor_discovery.gemini_extraction_failed"
@@ -136,7 +143,7 @@ def test_company_extraction_stops_immediately_on_quota_exhaustion(monkeypatch, c
     assert attempt_records[-1].retrying is False
 
 
-def test_deterministic_tavily_candidates_avoid_gemini_and_are_verified(monkeypatch):
+def test_deterministic_tavily_candidate_without_relationship_evidence_is_dropped(monkeypatch):
     search_result = {
         "url": "https://bigcommerce.com/platform",
         "title": "BigCommerce Ecommerce Platform",
@@ -154,8 +161,8 @@ def test_deterministic_tavily_candidates_avoid_gemini_and_are_verified(monkeypat
         verified_candidates.append(dict(candidate))
         return {
             "name": candidate["name"],
-            "product_name": "",
-            "evidence_status": "company_and_product_mentioned",
+            "product_name": "Ecommerce platform",
+            "evidence_status": "market_overlap_unverified",
             "evidence_confidence": 0.60,
             "heuristic_evidence_score": 0.60,
             "evidence_strength": "partial",
@@ -164,11 +171,11 @@ def test_deterministic_tavily_candidates_avoid_gemini_and_are_verified(monkeypat
             "evidence_details": [{
                 "source_url": "https://bigcommerce.com/",
                 "accessible": True,
-                "classification": "company_and_product_mentioned",
+                "classification": "market_overlap_unverified",
                 "excerpts": [{
                     "source_url": "https://bigcommerce.com/",
                     "matched_text": "BigCommerce is an ecommerce platform for merchants.",
-                    "classification": "company_and_product_mentioned",
+                    "classification": "market_overlap_unverified",
                 }],
             }],
         }
@@ -197,9 +204,7 @@ def test_deterministic_tavily_candidates_avoid_gemini_and_are_verified(monkeypat
     assert len(verified_candidates) == 1
     assert verified_candidates[0]["name"] == "BigCommerce"
     assert verified_candidates[0]["official_website"] == "https://bigcommerce.com"
-    assert result[0]["name"] == "BigCommerce"
-    assert result[0]["competitor_type"] == "unclear"
-    assert result[0]["verification_status"] == "official_website_validated"
+    assert result == []
     assert "competitor_discovery_status" not in analysis
 
 
@@ -303,7 +308,7 @@ def test_gemini_retries_transient_errors_with_a_controlled_retry(monkeypatch):
     monkeypatch.setattr(llm_service.asyncio, "sleep", no_sleep)
     result = asyncio.run(llm_service.analyze_with_ai({"content": "ignored by mocked validation"}))
 
-    assert result is VALID_ANALYSIS
+    assert result["competitor_analysis"]["competitors"] == []
     assert calls["count"] == 2
     assert models == [llm_service.PRIMARY_GEMINI_MODEL] * 2
 
@@ -339,7 +344,7 @@ def test_identical_concurrent_website_analyses_share_and_cache_one_gemini_call(m
 
     assert calls["count"] == 1
     assert "marker" not in cached_result
-    assert all(result["competitor_analysis"] == {} for result in results)
+    assert all(result["competitor_analysis"]["competitors"] == [] for result in results)
 
 
 def test_competitor_discovery_skips_while_gemini_quota_cooldown_is_active(monkeypatch):
@@ -380,6 +385,7 @@ def test_gemini_falls_back_once_after_primary_transient_retries(monkeypatch, cap
     monkeypatch.setattr(llm_service, "validate_website_data", lambda _data: None)
     monkeypatch.setattr(llm_service, "validate_analysis", lambda _data, **_kwargs: VALID_ANALYSIS)
     monkeypatch.setattr(llm_service, "add_semantic_competitor_ranking", lambda data: data)
+    monkeypatch.setattr(llm_service.random, "uniform", lambda low, high: (low + high) / 2)
 
     async def record_sleep(delay):
         delays.append(delay)
@@ -388,7 +394,7 @@ def test_gemini_falls_back_once_after_primary_transient_retries(monkeypatch, cap
     with caplog.at_level("INFO", logger="app.services.llm_service"):
         result = asyncio.run(llm_service.analyze_with_ai({"content": "ignored"}))
 
-    assert result is VALID_ANALYSIS
+    assert result["competitor_analysis"]["competitors"] == []
     assert models == [llm_service.PRIMARY_GEMINI_MODEL] * 2 + [llm_service.FALLBACK_GEMINI_MODEL]
     assert delays == [0.5]
     assert any(
@@ -430,7 +436,7 @@ def test_gemini_does_not_fallback_for_permanent_or_validation_errors(monkeypatch
     assert models == [llm_service.PRIMARY_GEMINI_MODEL] * 2
 
 
-def test_gemini_quota_errors_stop_without_fallback_and_log_safely(monkeypatch, caplog):
+def test_gemini_quota_errors_stop_without_retry_or_fallback_and_log_safely(monkeypatch, caplog):
     calls = {"count": 0}
 
     class FakeModels:
@@ -455,6 +461,8 @@ def test_gemini_quota_errors_stop_without_fallback_and_log_safely(monkeypatch, c
 
     assert calls["count"] == 1
     assert raised.value.status_code == 503
+    assert raised.value.code == "gemini_rate_limited"
+    assert "temporarily rate limited" in raised.value.public_message
     assert "DO_NOT_EXPOSE" not in str(raised.value)
     request_failures = [
         record for record in caplog.records
@@ -542,7 +550,7 @@ def test_partial_tavily_search_failure_preserves_available_results(monkeypatch):
             "content": "Northstar Systems develops website intelligence software."
         }]
 
-    async def no_candidates(profile, results):
+    async def no_candidates(profile, results, website_url=""):
         return []
 
     monkeypatch.setattr(competitor_discovery, "search_tavily", search)
@@ -613,3 +621,117 @@ def test_duplicate_evidence_urls_are_fetched_and_returned_once(monkeypatch):
     assert result["evidence_pages_checked"] == 1
     assert len(result["evidence_details"]) == 1
     assert len(result["evidence_details"][0]["excerpts"]) == 1
+
+
+def test_competitor_extraction_cache_uses_normalized_inputs(monkeypatch, caplog):
+    calls = {"count": 0}
+
+    class FakeModels:
+        def generate_content(self, **_kwargs):
+            calls["count"] += 1
+            return type("Response", (), {"text": '{"companies":[{"name":"Northstar"}]}'})()
+
+    monkeypatch.setattr(
+        competitor_discovery,
+        "gemini_client",
+        type("Client", (), {"models": FakeModels()})(),
+    )
+    first = asyncio.run(competitor_discovery.extract_companies_with_gemini(
+        {"brand_name": "Example Brand", "category": "SaaS", "products_services": ["CRM"]},
+        [{"url": "https://northstar.example/company/", "title": "Northstar CRM", "content": "CRM for growing teams"}],
+        "https://www.example.com/path",
+    ))
+    second = asyncio.run(competitor_discovery.extract_companies_with_gemini(
+        {"BRAND_NAME": "EXAMPLE BRAND", "CATEGORY": " saas ", "PRODUCTS_SERVICES": [" crm "]},
+        [{"url": "https://northstar.example/company", "title": " Northstar   CRM ", "content": "CRM FOR GROWING TEAMS"}],
+        "https://example.com/another-path",
+    ))
+
+    assert first == second == [{"name": "Northstar"}]
+    assert calls["count"] == 1
+    assert any(
+        getattr(record, "diagnostic_event", None)
+        == "competitor_discovery.gemini_extraction_cache_hit"
+        for record in caplog.records
+    )
+
+
+def test_shared_gemini_request_limit_covers_concurrent_callers():
+    active = {"now": 0, "max": 0}
+    lock = threading.Lock()
+
+    class FakeModels:
+        def generate_content(self, **_kwargs):
+            with lock:
+                active["now"] += 1
+                active["max"] = max(active["max"], active["now"])
+            time.sleep(0.03)
+            with lock:
+                active["now"] -= 1
+            return type("Response", (), {"text": "ok"})()
+
+    client = type("Client", (), {"models": FakeModels()})()
+
+    async def run_calls():
+        return await asyncio.gather(*[
+            llm_service.generate_gemini_content(client, 2, model="test")
+            for _ in range(6)
+        ])
+
+    responses = asyncio.run(run_calls())
+
+    assert len(responses) == 6
+    assert 1 < active["max"] <= llm_service.GEMINI_MAX_CONCURRENT_REQUESTS
+
+
+def test_retry_after_sets_quota_cooldown_without_retry_or_fallback(monkeypatch, caplog):
+    models = []
+    delays = []
+
+    class RateLimitError(Exception):
+        status_code = 429
+        headers = {"Retry-After": "3"}
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            models.append(kwargs["model"])
+            raise RateLimitError("429 RESOURCE_EXHAUSTED")
+
+    monkeypatch.setattr(
+        llm_service,
+        "client",
+        type("Client", (), {"models": FakeModels()})(),
+    )
+    monkeypatch.setattr(llm_service, "validate_website_data", lambda _data: None)
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(llm_service.asyncio, "sleep", record_sleep)
+    monkeypatch.setattr(llm_service.random, "uniform", lambda _low, _high: 0.4)
+    analysis_token = llm_service.set_analysis_id("analysis-test-123")
+    with caplog.at_level("WARNING", logger="app.services.llm_service"):
+        with pytest.raises(ExternalServiceError):
+            asyncio.run(llm_service.analyze_with_ai({"content": "retry-after test"}))
+    llm_service.reset_analysis_id(analysis_token)
+
+    assert models == [llm_service.PRIMARY_GEMINI_MODEL]
+    assert delays == []
+    remaining, reason = llm_service.gemini_cooldown_remaining()
+    assert reason == "gemini_rate_limited"
+    assert 0 < remaining <= 3.0
+    failures = [
+        record for record in caplog.records
+        if getattr(record, "diagnostic_event", None) == "gemini.request_failed"
+    ]
+    assert len(failures) == 1
+    assert all(record.analysis_id == "analysis-test-123" for record in failures)
+
+
+def test_retry_after_is_not_capped_below_provider_request(monkeypatch):
+    class RateLimitError(Exception):
+        status_code = 429
+        headers = {"Retry-After": "42"}
+
+    assert llm_service._retry_after_seconds(RateLimitError()) == 42
+    assert llm_service._retry_delay(0, RateLimitError()) == 42
